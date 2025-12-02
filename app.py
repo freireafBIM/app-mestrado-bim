@@ -180,7 +180,7 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
 # --- FRONTEND ---
 
 def main():
-    st.set_page_config(page_title="Gestor BIM", page_icon="🏗️")
+    st.set_page_config(page_title="Gestão de Armaduras", page_icon="🏗️")
     
     # LOGIN
     if 'logado' not in st.session_state: st.session_state['logado'] = False
@@ -204,7 +204,7 @@ def main():
             st.session_state['logado'] = False
             st.rerun()
 
-    nome_projeto = st.text_input("Nome do Projeto / Obra", placeholder="Ex: Ed. Diogenes e Kely")
+    nome_projeto = st.text_input("Nome do Projeto / Obra", placeholder="Ex: Ed. Thiago")
     arquivo_upload = st.file_uploader("Carregar arquivo IFC", type=["ifc"])
     
     if arquivo_upload and nome_projeto:
@@ -259,3 +259,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
