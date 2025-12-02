@@ -45,14 +45,31 @@ def conectar_google_sheets():
     return client
 
 def enviar_pdf_drive(pdf_buffer, nome_arquivo):
-    """Envia o PDF DIRETAMENTE para a pasta compartilhada pelo ID."""
+    """Envia o PDF e trata IDs de pasta incorretos automaticamente."""
     creds = obter_credenciais()
     service = build('drive', 'v3', credentials=creds)
     
-    # Metadados do arquivo (Nome e PASTA PAI)
+    # --- LIMPEZA AUTOMÁTICA DO ID ---
+    # Se o usuário colou o link inteiro ou com parâmetros, pegamos só o ID real
+    pasta_id_limpo = ID_PASTA_DRIVE
+    
+    # 1. Se for um link completo (https://...), pega só o final
+    if "folders/" in pasta_id_limpo:
+        pasta_id_limpo = pasta_id_limpo.split("folders/")[1]
+        
+    # 2. Remove qualquer coisa depois de '?' (ex: ?usp=sharing)
+    if "?" in pasta_id_limpo:
+        pasta_id_limpo = pasta_id_limpo.split("?")[0]
+        
+    # 3. Remove espaços em branco
+    pasta_id_limpo = pasta_id_limpo.strip()
+
+    # --- FIM DA LIMPEZA ---
+    
+    # Metadados do arquivo
     file_metadata = {
         'name': nome_arquivo,
-        'parents': [ID_PASTA_DRIVE] # <--- O SEGREDO ESTÁ AQUI
+        'parents': [pasta_id_limpo] # Usa o ID limpo
     }
     
     media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
@@ -62,14 +79,14 @@ def enviar_pdf_drive(pdf_buffer, nome_arquivo):
     file_id = file.get('id')
     web_link = file.get('webViewLink')
     
-    # Deixar público para leitura (para o AppSheet abrir)
+    # Permissões
     try:
         service.permissions().create(
             fileId=file_id,
             body={'role': 'reader', 'type': 'anyone'}
         ).execute()
     except:
-        pass # Se der erro de permissão, segue o jogo (pode ser restrição da pasta)
+        pass 
     
     return web_link
 
@@ -274,4 +291,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
