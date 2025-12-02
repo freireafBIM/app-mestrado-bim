@@ -6,6 +6,8 @@ import ifcopenshell.util.element
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 import qrcode
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -16,37 +18,85 @@ import toml
 # --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
+NOME_PASTA_DRIVE = "Etiquetas_BIM_Projetos" # Nome da pasta que será criada no Drive
 
-# --- FUNÇÕES DE BACKEND ---
+# --- FUNÇÕES DE CONEXÃO ---
 
-def conectar_google_sheets():
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    
-    # Lógica Híbrida: Tenta Nuvem (Secrets) primeiro, depois Local (JSON)
+def obter_credenciais():
+    """Retorna o objeto de credenciais (Local ou Nuvem)."""
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
     if "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return Credentials.from_service_account_info(creds_dict, scopes=scopes)
     elif os.path.exists(ARQUIVO_CREDENCIAIS):
-        creds = Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=scopes)
+        return Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=scopes)
     else:
-        st.error("Arquivo de credenciais não encontrado!")
+        st.error("Credenciais não encontradas!")
         return None
 
+def conectar_google_sheets():
+    creds = obter_credenciais()
     client = gspread.authorize(creds)
     return client
 
+def enviar_pdf_drive(pdf_buffer, nome_arquivo):
+    """Envia o PDF para o Google Drive e retorna o Link Público."""
+    creds = obter_credenciais()
+    service = build('drive', 'v3', credentials=creds)
+    
+    # 1. Verifica/Cria a pasta no Drive para organizar
+    query = f"name='{NOME_PASTA_DRIVE}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    results = service.files().list(q=query, fields="files(id)").execute()
+    items = results.get('files', [])
+    
+    if not items:
+        # Cria a pasta se não existir
+        file_metadata = {
+            'name': NOME_PASTA_DRIVE,
+            'mimeType': 'application/vnd.google-apps.folder'
+        }
+        folder = service.files().create(body=file_metadata, fields='id').execute()
+        folder_id = folder.get('id')
+    else:
+        folder_id = items[0]['id']
+
+    # 2. Faz o Upload do Arquivo
+    file_metadata = {
+        'name': nome_arquivo,
+        'parents': [folder_id]
+    }
+    media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
+    
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+    file_id = file.get('id')
+    web_link = file.get('webViewLink') # Link para abrir no navegador
+    
+    # 3. Permissões (Deixar público para quem tem o link ler)
+    # Isso é crucial para o AppSheet conseguir abrir
+    service.permissions().create(
+        fileId=file_id,
+        body={'role': 'reader', 'type': 'anyone'}
+    ).execute()
+    
+    return web_link
+
+# --- FUNÇÕES DE LÓGICA DE NEGÓCIO ---
+
 def extrair_texto_armadura(pilar):
-    """Lógica de inferência de armadura."""
-    barras_encontradas = []
+    """Inferência de armadura."""
+    barras = []
     relacoes = getattr(pilar, 'IsDecomposedBy', [])
     for rel in relacoes:
         if rel.is_a('IfcRelAggregates'):
             for obj in rel.RelatedObjects:
                 if obj.is_a('IfcReinforcingBar'):
-                    diam = round(obj.NominalDiameter * 1000, 1)
-                    barras_encontradas.append(diam)
+                    d = round(obj.NominalDiameter * 1000, 1)
+                    barras.append(d)
     
-    if not barras_encontradas:
+    if not barras:
         psets = ifcopenshell.util.element.get_psets(pilar)
         for nome, dados in psets.items():
             if 'Armadura' in nome or 'Reinforcement' in nome:
@@ -55,13 +105,11 @@ def extrair_texto_armadura(pilar):
         return "Verificar Projeto (Sem vínculo 3D)"
     
     from collections import Counter
-    c = Counter(barras_encontradas)
+    c = Counter(barras)
     return " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
 
 def processar_ifc(caminho_arquivo, nome_projeto_input):
-    """
-    Processa o IFC e adiciona a coluna PROJETO.
-    """
+    """Processa IFC e retorna dados."""
     ifc_file = ifcopenshell.open(caminho_arquivo)
     pilares = ifc_file.by_type('IfcColumn')
     dados = []
@@ -75,7 +123,6 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
         guid = pilar.GlobalId
         nome = pilar.Name if pilar.Name else "S/N"
         
-        # Geometria
         secao = "N/A"
         if pilar.Representation:
             for rep in pilar.Representation.Representations:
@@ -93,7 +140,6 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
         if pilar.ContainedInStructure:
             pavimento = pilar.ContainedInStructure[0].RelatingStructure.Name
 
-        # ADICIONA O NOME DO PROJETO NO DICIONÁRIO
         dados.append({
             'Projeto': nome_projeto_input, 
             'ID_Unico': guid, 
@@ -103,14 +149,14 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
             'Pavimento': pavimento,
             'Status': 'A CONFERIR', 
             'Data_Conferencia': '', 
-            'Responsavel': ''
+            'Responsavel': '',
+            'Link_PDF': '' # Placeholder, será preenchido depois
         })
     
     dados.sort(key=lambda x: x['Nome'])
     return dados
 
 def gerar_pdf_memoria(dados_pilares, nome_projeto):
-    """Gera o PDF com o nome do projeto correto."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     largura_pag, altura_pag = A4
@@ -123,7 +169,6 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.setLineWidth(0.5)
         c.rect(x, y, largura_etq, altura_etq)
         
-        # QR Code
         qr = qrcode.QRCode(box_size=10, border=1)
         qr.add_data(pilar['ID_Unico'])
         qr.make(fit=True)
@@ -140,7 +185,6 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.drawString(x+45*mm, y+25*mm, f"Sec: {pilar['Secao']}")
         c.drawString(x+45*mm, y+20*mm, f"Pav: {pilar['Pavimento']}")
         c.setFont("Helvetica-Oblique", 8)
-        # Usa o nome do projeto digitado pelo usuário
         c.drawString(x+45*mm, y+10*mm, f"Obra: {nome_projeto[:15]}")
         
         x += largura_etq + espaco
@@ -156,98 +200,84 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
     buffer.seek(0)
     return buffer
 
-# --- FRONTEND (INTERFACE WEB) ---
+# --- FRONTEND ---
 
 def main():
     st.set_page_config(page_title="Gestor Multi-Obras BIM", page_icon="🏗️")
     
-    # --- SISTEMA DE LOGIN COM SENHA (RESTAURADO) ---
-    if 'logado' not in st.session_state:
-        st.session_state['logado'] = False
-
+    if 'logado' not in st.session_state: st.session_state['logado'] = False
     if not st.session_state['logado']:
         st.title("🔒 Acesso Restrito")
-        st.markdown("Área exclusiva para gestores BIM.")
-        
-        senha = st.text_input("Digite a senha de acesso:", type="password")
-        
-        if st.button("Entrar no Sistema"):
-            if senha == "bim123": # <--- SUA SENHA AQUI
+        s = st.text_input("Senha", type="password")
+        if st.button("Entrar"):
+            if s == "bim123":
                 st.session_state['logado'] = True
-                st.rerun() # Recarrega a página para entrar
-            else:
-                st.error("Senha incorreta. Tente novamente.")
-        return # Para a execução aqui se não estiver logado
+                st.rerun()
+            else: st.error("Senha incorreta")
+        return
 
-    # --- TELA PRINCIPAL (APÓS LOGIN) ---
     st.title("🏗️ Gestor Multi-Obras BIM")
-    st.markdown("Carregue novos projetos para a base de dados central.")
-    
-    # Botão de Logout (Opcional, mas útil)
-    if st.sidebar.button("Sair / Logout"):
+    if st.sidebar.button("Sair"):
         st.session_state['logado'] = False
         st.rerun()
 
-    # 1. INPUT DO NOME DO PROJETO
     nome_projeto = st.text_input("Nome do Projeto / Obra", placeholder="Ex: Ed. Diogenes e Kely")
-    
     arquivo_upload = st.file_uploader("Carregar arquivo IFC", type=["ifc"])
     
     if arquivo_upload is not None and nome_projeto:
-        st.info(f"Arquivo: {arquivo_upload.name} | Obra: {nome_projeto}")
-        
-        if st.button("🚀 PROCESSAR E ADICIONAR", type="primary"):
+        if st.button("🚀 PROCESSAR, GERAR PDF E SALVAR", type="primary"):
             try:
-                # Salva IFC temporário
+                # 1. Processar IFC
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
                     tmp_file.write(arquivo_upload.getvalue())
                     caminho_temp = tmp_file.name
                 
-                # Processa Dados
-                with st.spinner('Lendo IFC e extraindo dados...'):
+                with st.spinner('Extraindo dados do BIM...'):
                     novos_dados = processar_ifc(caminho_temp, nome_projeto)
+                os.remove(caminho_temp)
+
+                # 2. Gerar PDF na memória
+                with st.spinner('Gerando Etiquetas PDF...'):
+                    pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
+
+                # 3. Enviar PDF para Google Drive
+                with st.spinner('Enviando PDF para Google Drive...'):
+                    nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
+                    link_publico = enviar_pdf_drive(pdf_buffer, nome_arquivo_pdf)
                 
-                # Lógica Inteligente de Banco de Dados
-                with st.spinner('Sincronizando com Google Sheets...'):
+                # 4. Atualizar os dados com o Link
+                for item in novos_dados:
+                    item['Link_PDF'] = link_publico
+
+                # 5. Salvar na Planilha
+                with st.spinner('Atualizando Banco de Dados...'):
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     ws = sh.sheet1
                     
-                    # 1. Baixa tudo que já tem lá
                     dados_existentes = ws.get_all_records()
                     df_antigo = pd.DataFrame(dados_existentes)
                     
-                    # 2. Se já tem dados, remove se houver duplicata deste mesmo projeto
-                    # (Isso previne duplicidade se você subir o mesmo arquivo duas vezes)
                     if not df_antigo.empty and 'Projeto' in df_antigo.columns:
-                        # Mantém tudo que NÃO é do projeto atual
                         df_limpo = df_antigo[df_antigo['Projeto'] != nome_projeto]
                     else:
                         df_limpo = pd.DataFrame()
 
-                    # 3. Junta o Antigo Limpo + O Novo
                     df_novo = pd.DataFrame(novos_dados)
                     df_final = pd.concat([df_limpo, df_novo], ignore_index=True)
                     
-                    # 4. Sobe tudo de volta
                     ws.clear()
                     ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
                 
-                # Gera PDF
-                with st.spinner('Gerando arquivo de Etiquetas...'):
-                    pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
+                st.success(f"✅ Sucesso! PDF salvo no Drive e vinculado ao projeto '{nome_projeto}'.")
+                st.markdown(f"**[Clique aqui para acessar o PDF gerado]({link_publico})**")
                 
-                st.success(f"✅ Projeto '{nome_projeto}' atualizado com sucesso!")
-                st.metric(label="Total de Pilares na Base", value=len(df_final), delta=len(novos_dados))
-                
-                st.download_button("📥 BAIXAR ETIQUETAS (PDF)", pdf_buffer, f"Etiquetas_{nome_projeto}.pdf", "application/pdf")
-                os.remove(caminho_temp)
+                # Reseta o ponteiro do buffer para permitir download direto também
+                pdf_buffer.seek(0)
+                st.download_button("📥 BAIXAR ETIQUETAS AGORA", pdf_buffer, nome_arquivo_pdf, "application/pdf")
                 
             except Exception as e:
-                st.error(f"Erro durante o processamento: {e}")
-                
-    elif arquivo_upload and not nome_projeto:
-        st.warning("⚠️ Atenção: Você precisa digitar o nome do projeto antes de processar.")
+                st.error(f"Erro: {e}")
 
 if __name__ == "__main__":
     main()
