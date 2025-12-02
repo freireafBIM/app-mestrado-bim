@@ -278,4 +278,19 @@ def main():
                         df_limpo = pd.DataFrame()
 
                     df_novo = pd.DataFrame(novos_dados)
-                    df_final = pd.
+                    df_final = pd.concat([df_limpo, df_novo], ignore_index=True)
+                    
+                    ws.clear()
+                    ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
+                
+                st.success(f"✅ Sucesso! PDF salvo no Drive e vinculado ao projeto '{nome_projeto}'.")
+                st.markdown(f"**[Clique aqui para testar o link do PDF]({link_publico})**")
+                
+                pdf_buffer.seek(0)
+                st.download_button("📥 BAIXAR ETIQUETAS AGORA", pdf_buffer, nome_arquivo_pdf, "application/pdf")
+                
+            except Exception as e:
+                st.error(f"Erro: {e}")
+
+if __name__ == "__main__":
+    main()
