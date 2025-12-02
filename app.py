@@ -19,7 +19,7 @@ import toml
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
-# !!! COLE O ID DA PASTA DO GOOGLE DRIVE AQUI !!!
+# !!! COLE O ID DA PASTA DO GOOGLE DRIVE AQUI (DENTRO DAS ASPAS) !!!
 ID_PASTA_DRIVE = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff" 
 
 # --- FUNÇÕES DE CONEXÃO ---
@@ -45,31 +45,14 @@ def conectar_google_sheets():
     return client
 
 def enviar_pdf_drive(pdf_buffer, nome_arquivo):
-    """Envia o PDF e trata IDs de pasta incorretos automaticamente."""
+    """Envia o PDF DIRETAMENTE para a pasta compartilhada pelo ID."""
     creds = obter_credenciais()
     service = build('drive', 'v3', credentials=creds)
     
-    # --- LIMPEZA AUTOMÁTICA DO ID ---
-    # Se o usuário colou o link inteiro ou com parâmetros, pegamos só o ID real
-    pasta_id_limpo = ID_PASTA_DRIVE
-    
-    # 1. Se for um link completo (https://...), pega só o final
-    if "folders/" in pasta_id_limpo:
-        pasta_id_limpo = pasta_id_limpo.split("folders/")[1]
-        
-    # 2. Remove qualquer coisa depois de '?' (ex: ?usp=sharing)
-    if "?" in pasta_id_limpo:
-        pasta_id_limpo = pasta_id_limpo.split("?")[0]
-        
-    # 3. Remove espaços em branco
-    pasta_id_limpo = pasta_id_limpo.strip()
-
-    # --- FIM DA LIMPEZA ---
-    
-    # Metadados do arquivo
+    # Metadados do arquivo: Nome e PASTA PAI (O ID que você colou)
     file_metadata = {
         'name': nome_arquivo,
-        'parents': [pasta_id_limpo] # Usa o ID limpo
+        'parents': [ID_PASTA_DRIVE] # <--- O SEGREDO ESTÁ AQUI
     }
     
     media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
@@ -79,14 +62,14 @@ def enviar_pdf_drive(pdf_buffer, nome_arquivo):
     file_id = file.get('id')
     web_link = file.get('webViewLink')
     
-    # Permissões
+    # Deixar público para leitura (para o AppSheet abrir)
     try:
         service.permissions().create(
             fileId=file_id,
             body={'role': 'reader', 'type': 'anyone'}
         ).execute()
     except:
-        pass 
+        pass # Se der erro de permissão aqui, geralmente o link ainda funciona para quem tem acesso
     
     return web_link
 
@@ -233,6 +216,11 @@ def main():
     if arquivo_upload is not None and nome_projeto:
         if st.button("🚀 PROCESSAR, GERAR PDF E SALVAR", type="primary"):
             try:
+                # 0. VERIFICAÇÃO DE SEGURANÇA
+                if "COLE_O_ID" in ID_PASTA_DRIVE:
+                    st.error("ERRO: Você esqueceu de colar o ID da Pasta do Drive no código Python!")
+                    return
+
                 # 1. Processar IFC
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
                     tmp_file.write(arquivo_upload.getvalue())
@@ -249,11 +237,6 @@ def main():
                 # 3. Enviar PDF para Google Drive (COM ID FIXO)
                 with st.spinner('Enviando PDF para Google Drive...'):
                     nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
-                    # Se você não preencher o ID lá em cima, vai dar erro aqui!
-                    if ID_PASTA_DRIVE == "COLE_O_ID_DA_SUA_PASTA_AQUI":
-                        st.error("Erro: Você esqueceu de colocar o ID da Pasta no código Python!")
-                        return
-                    
                     link_publico = enviar_pdf_drive(pdf_buffer, nome_arquivo_pdf)
                 
                 # 4. Atualizar os dados com o Link
@@ -291,5 +274,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
