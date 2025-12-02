@@ -18,7 +18,9 @@ import toml
 # --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
-NOME_PASTA_DRIVE = "Etiquetas_BIM_Projetos" # Nome da pasta que será criada no Drive
+
+# !!! COLE O ID DA PASTA DO GOOGLE DRIVE AQUI !!!
+ID_PASTA_DRIVE = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff?usp=drive_link" 
 
 # --- FUNÇÕES DE CONEXÃO ---
 
@@ -43,43 +45,31 @@ def conectar_google_sheets():
     return client
 
 def enviar_pdf_drive(pdf_buffer, nome_arquivo):
-    """Envia o PDF para o Google Drive e retorna o Link Público."""
+    """Envia o PDF DIRETAMENTE para a pasta compartilhada pelo ID."""
     creds = obter_credenciais()
     service = build('drive', 'v3', credentials=creds)
     
-    # 1. Verifica/Cria a pasta no Drive para organizar
-    query = f"name='{NOME_PASTA_DRIVE}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
-    results = service.files().list(q=query, fields="files(id)").execute()
-    items = results.get('files', [])
-    
-    if not items:
-        # Cria a pasta se não existir
-        file_metadata = {
-            'name': NOME_PASTA_DRIVE,
-            'mimeType': 'application/vnd.google-apps.folder'
-        }
-        folder = service.files().create(body=file_metadata, fields='id').execute()
-        folder_id = folder.get('id')
-    else:
-        folder_id = items[0]['id']
-
-    # 2. Faz o Upload do Arquivo
+    # Metadados do arquivo (Nome e PASTA PAI)
     file_metadata = {
         'name': nome_arquivo,
-        'parents': [folder_id]
+        'parents': [ID_PASTA_DRIVE] # <--- O SEGREDO ESTÁ AQUI
     }
+    
     media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
     
+    # Cria o arquivo
     file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
     file_id = file.get('id')
-    web_link = file.get('webViewLink') # Link para abrir no navegador
+    web_link = file.get('webViewLink')
     
-    # 3. Permissões (Deixar público para quem tem o link ler)
-    # Isso é crucial para o AppSheet conseguir abrir
-    service.permissions().create(
-        fileId=file_id,
-        body={'role': 'reader', 'type': 'anyone'}
-    ).execute()
+    # Deixar público para leitura (para o AppSheet abrir)
+    try:
+        service.permissions().create(
+            fileId=file_id,
+            body={'role': 'reader', 'type': 'anyone'}
+        ).execute()
+    except:
+        pass # Se der erro de permissão, segue o jogo (pode ser restrição da pasta)
     
     return web_link
 
@@ -109,7 +99,6 @@ def extrair_texto_armadura(pilar):
     return " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
 
 def processar_ifc(caminho_arquivo, nome_projeto_input):
-    """Processa IFC e retorna dados."""
     ifc_file = ifcopenshell.open(caminho_arquivo)
     pilares = ifc_file.by_type('IfcColumn')
     dados = []
@@ -150,7 +139,7 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
             'Status': 'A CONFERIR', 
             'Data_Conferencia': '', 
             'Responsavel': '',
-            'Link_PDF': '' # Placeholder, será preenchido depois
+            'Link_PDF': ''
         })
     
     dados.sort(key=lambda x: x['Nome'])
@@ -240,9 +229,14 @@ def main():
                 with st.spinner('Gerando Etiquetas PDF...'):
                     pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
 
-                # 3. Enviar PDF para Google Drive
+                # 3. Enviar PDF para Google Drive (COM ID FIXO)
                 with st.spinner('Enviando PDF para Google Drive...'):
                     nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
+                    # Se você não preencher o ID lá em cima, vai dar erro aqui!
+                    if ID_PASTA_DRIVE == "COLE_O_ID_DA_SUA_PASTA_AQUI":
+                        st.error("Erro: Você esqueceu de colocar o ID da Pasta no código Python!")
+                        return
+                    
                     link_publico = enviar_pdf_drive(pdf_buffer, nome_arquivo_pdf)
                 
                 # 4. Atualizar os dados com o Link
@@ -272,7 +266,6 @@ def main():
                 st.success(f"✅ Sucesso! PDF salvo no Drive e vinculado ao projeto '{nome_projeto}'.")
                 st.markdown(f"**[Clique aqui para acessar o PDF gerado]({link_publico})**")
                 
-                # Reseta o ponteiro do buffer para permitir download direto também
                 pdf_buffer.seek(0)
                 st.download_button("📥 BAIXAR ETIQUETAS AGORA", pdf_buffer, nome_arquivo_pdf, "application/pdf")
                 
