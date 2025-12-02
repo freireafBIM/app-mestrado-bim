@@ -12,17 +12,17 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 import io
 import toml
+import re # Biblioteca para limpar texto (Regex)
 
 # --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
-# --- FUNÇÕES DE CONEXÃO (Apenas Sheets) ---
+# --- FUNÇÕES DE CONEXÃO ---
 
 def conectar_google_sheets():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     
-    # Tenta pegar dos Secrets (Nuvem) ou Local
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
@@ -38,10 +38,15 @@ def conectar_google_sheets():
 
 # --- LÓGICA DE EXTRAÇÃO BIM ---
 
+def limpar_string(texto):
+    """Remove espaços e caracteres especiais para criar IDs limpos."""
+    if not texto: return "X"
+    # Mantém apenas letras e números e deixa maiúsculo
+    return "".join(e for e in str(texto) if e.isalnum()).upper()
+
 def extrair_texto_armadura(pilar):
-    """Inferência de armadura (Lógica 3D + Texto)."""
+    """Inferência de armadura."""
     barras = []
-    # 1. Tenta achar geometria 3D
     relacoes = getattr(pilar, 'IsDecomposedBy', [])
     for rel in relacoes:
         if rel.is_a('IfcRelAggregates'):
@@ -50,13 +55,11 @@ def extrair_texto_armadura(pilar):
                     d = round(obj.NominalDiameter * 1000, 1)
                     barras.append(d)
     
-    # 2. Se achou 3D, conta e formata
     if barras:
         from collections import Counter
         c = Counter(barras)
         return " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
     
-    # 3. Se não achou, tenta ler Property Sets de texto
     psets = ifcopenshell.util.element.get_psets(pilar)
     for nome, dados in psets.items():
         if 'Armadura' in nome or 'Reinforcement' in nome:
@@ -73,13 +76,29 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
     progresso = st.progress(0)
     total = len(pilares)
     
+    # Cria sufixo limpo do projeto (Ex: "Ed. Diogenes" -> "EDDIOGENES")
+    sufixo_projeto = limpar_string(nome_projeto_input)
+    
     for i, pilar in enumerate(pilares):
         progresso.progress((i + 1) / total)
         
         guid = pilar.GlobalId
         nome = pilar.Name if pilar.Name else "S/N"
         
-        # Geometria (Seção)
+        # 1. Pavimento (Extraído ANTES para compor o ID)
+        pavimento = "Térreo"
+        if pilar.ContainedInStructure:
+            pavimento = pilar.ContainedInStructure[0].RelatingStructure.Name
+        
+        # Cria sufixo limpo do pavimento (Ex: "1º Pavimento" -> "1PAVIMENTO")
+        sufixo_pav = limpar_string(pavimento)
+
+        # --- NOVA LÓGICA DE CHAVE PRIMÁRIA ---
+        # GUID + PAVIMENTO + PROJETO
+        # Ex: 3X64...-TERREO-EDDIOGENES
+        id_composto = f"{guid}-{sufixo_pav}-{sufixo_projeto}"
+
+        # 2. Geometria
         secao = "N/A"
         if pilar.Representation:
             for rep in pilar.Representation.Representations:
@@ -92,14 +111,10 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
                                 secao = f"{dims[0]:.0f}x{dims[1]:.0f}"
 
         armadura = extrair_texto_armadura(pilar)
-        
-        pavimento = "Térreo"
-        if pilar.ContainedInStructure:
-            pavimento = pilar.ContainedInStructure[0].RelatingStructure.Name
 
         dados.append({
             'Projeto': nome_projeto_input, 
-            'ID_Unico': guid, 
+            'ID_Unico': id_composto, # <--- AQUI ESTÁ A CHAVE NOVA
             'Nome': nome, 
             'Secao': secao,
             'Armadura': armadura, 
@@ -107,14 +122,13 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
             'Status': 'A CONFERIR', 
             'Data_Conferencia': '', 
             'Responsavel': ''
-            # Removemos a coluna Link_PDF para não dar erro na planilha antiga
         })
     
-    dados.sort(key=lambda x: x['Nome'])
+    # Ordena por Pavimento e depois por Nome
+    dados.sort(key=lambda x: (x['Pavimento'], x['Nome']))
     return dados
 
 def gerar_pdf_memoria(dados_pilares, nome_projeto):
-    """Gera o PDF na memória RAM para download imediato."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     largura_pag, altura_pag = A4
@@ -143,11 +157,13 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.drawString(x+45*mm, y+35*mm, f"PILAR: {pilar['Nome']}")
         c.setFont("Helvetica", 10)
         c.drawString(x+45*mm, y+25*mm, f"Sec: {pilar['Secao']}")
+        # Pavimento em destaque
+        c.setFont("Helvetica-Bold", 10)
         c.drawString(x+45*mm, y+20*mm, f"Pav: {pilar['Pavimento']}")
+        
         c.setFont("Helvetica-Oblique", 8)
         c.drawString(x+45*mm, y+10*mm, f"Obra: {nome_projeto[:15]}")
         
-        # Grid
         x += largura_etq + espaco
         if x + largura_etq > largura_pag - margem:
             x = margem
@@ -161,12 +177,12 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
     buffer.seek(0)
     return buffer
 
-# --- INTERFACE WEB (STREAMLIT) ---
+# --- FRONTEND ---
 
 def main():
     st.set_page_config(page_title="Gestor BIM", page_icon="🏗️")
     
-    # 1. LOGIN
+    # LOGIN
     if 'logado' not in st.session_state: st.session_state['logado'] = False
     
     if not st.session_state['logado']:
@@ -180,7 +196,6 @@ def main():
                 st.error("Senha incorreta.")
         return
 
-    # 2. TELA PRINCIPAL
     st.title("🏗️ Gestor de Etiquetas BIM")
     
     with st.sidebar:
@@ -195,45 +210,40 @@ def main():
     if arquivo_upload and nome_projeto:
         if st.button("🚀 PROCESSAR DADOS", type="primary"):
             try:
-                # Salva temporário
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
                     tmp_file.write(arquivo_upload.getvalue())
                     caminho_temp = tmp_file.name
                 
                 # A. Processamento
-                with st.spinner('Lendo IFC e extraindo dados...'):
+                with st.spinner('Lendo IFC e gerando Chaves Únicas por Pavimento...'):
                     novos_dados = processar_ifc(caminho_temp, nome_projeto)
                 os.remove(caminho_temp)
 
-                # B. Google Sheets (Lógica de Adicionar sem apagar os outros)
+                # B. Google Sheets
                 with st.spinner('Sincronizando Banco de Dados...'):
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     ws = sh.sheet1
                     
-                    # Baixa o que já existe
                     dados_existentes = ws.get_all_records()
                     df_antigo = pd.DataFrame(dados_existentes)
                     
-                    # Remove duplicatas DO MESMO projeto (para atualizar)
                     if not df_antigo.empty and 'Projeto' in df_antigo.columns:
                         df_limpo = df_antigo[df_antigo['Projeto'] != nome_projeto]
                     else:
                         df_limpo = pd.DataFrame()
 
-                    # Junta antigo + novo
                     df_novo = pd.DataFrame(novos_dados)
                     df_final = pd.concat([df_limpo, df_novo], ignore_index=True)
                     
-                    # Sobe tudo
                     ws.clear()
                     ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
 
                 # C. Gerar PDF
-                with st.spinner('Gerando arquivo de impressão...'):
+                with st.spinner('Gerando etiquetas...'):
                     pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
                 
-                st.success(f"✅ Sucesso! {len(novos_dados)} pilares processados para o projeto '{nome_projeto}'.")
+                st.success(f"✅ Sucesso! {len(novos_dados)} pilares identificados e diferenciados por pavimento.")
                 
                 # D. Botão de Download
                 nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
