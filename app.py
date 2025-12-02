@@ -6,8 +6,6 @@ import ifcopenshell.util.element
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import qrcode
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -15,82 +13,35 @@ from reportlab.lib.units import mm
 import io
 import toml
 
-# --- CONFIGURAÇÕES GERAIS ---
+# --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
-# --- ID DA PASTA VALIDADO PELO DIAGNÓSTICO ---
-ID_PASTA_DRIVE = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff" 
+# --- FUNÇÕES DE CONEXÃO (Apenas Sheets) ---
 
-# --- FUNÇÕES DE CONEXÃO ---
-
-def obter_credenciais():
-    """Retorna o objeto de credenciais (Local ou Nuvem)."""
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
-    ]
-    # Tenta pegar dos Secrets (Streamlit Cloud)
+def conectar_google_sheets():
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    
+    # Tenta pegar dos Secrets (Nuvem) ou Local
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
-        return Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    # Tenta pegar local
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     elif os.path.exists(ARQUIVO_CREDENCIAIS):
-        return Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=scopes)
+        creds = Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=scopes)
     else:
-        st.error("ERRO CRÍTICO: Credenciais não encontradas (JSON ou Secrets).")
+        st.error("ERRO CRÍTICO: Credenciais não encontradas.")
         st.stop()
         return None
 
-def conectar_google_sheets():
-    creds = obter_credenciais()
     client = gspread.authorize(creds)
     return client
 
-def enviar_pdf_drive(pdf_buffer, nome_arquivo):
-    """Envia o PDF para a pasta ESPECÍFICA (ID) para evitar erro de cota."""
-    creds = obter_credenciais()
-    service = build('drive', 'v3', credentials=creds)
-    
-    # Metadados OBRIGATÓRIOS: Nome e PASTA PAI
-    # Sem 'parents', ele tenta salvar na raiz e dá erro de cota.
-    file_metadata = {
-        'name': nome_arquivo,
-        'parents': [ID_PASTA_DRIVE] 
-    }
-    
-    media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
-    
-    try:
-        # Cria o arquivo
-        file = service.files().create(
-            body=file_metadata, 
-            media_body=media, 
-            fields='id, webViewLink',
-            supportsAllDrives=True
-        ).execute()
-        
-        file_id = file.get('id')
-        web_link = file.get('webViewLink')
-        
-        # Deixar público para leitura (necessário para o AppSheet abrir)
-        service.permissions().create(
-            fileId=file_id,
-            body={'role': 'reader', 'type': 'anyone'}
-        ).execute()
-        
-        return web_link
+# --- LÓGICA DE EXTRAÇÃO BIM ---
 
-    except Exception as e:
-        st.error(f"Erro no Upload do Drive: {e}")
-        raise e
-
-# --- FUNÇÕES DE PROCESSAMENTO BIM (TQS) ---
-
-def extrair_dados_tqs(pilar):
-    """Lógica específica para ler dados do TQS."""
-    # 1. Armadura (Inferência 3D)
+def extrair_texto_armadura(pilar):
+    """Inferência de armadura (Lógica 3D + Texto)."""
     barras = []
+    # 1. Tenta achar geometria 3D
     relacoes = getattr(pilar, 'IsDecomposedBy', [])
     for rel in relacoes:
         if rel.is_a('IfcRelAggregates'):
@@ -99,40 +50,20 @@ def extrair_dados_tqs(pilar):
                     d = round(obj.NominalDiameter * 1000, 1)
                     barras.append(d)
     
+    # 2. Se achou 3D, conta e formata
     if barras:
         from collections import Counter
         c = Counter(barras)
-        armadura_txt = " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
-    else:
-        # Fallback: Tenta ler texto se não tiver 3D
-        armadura_txt = "Verificar Projeto (Sem vínculo 3D)"
-        psets = ifcopenshell.util.element.get_psets(pilar)
-        for nome, dados in psets.items():
-            if 'Armadura' in nome or 'Reinforcement' in nome:
-                for k, v in dados.items():
-                    if isinstance(v, str) and len(v) > 5: 
-                        armadura_txt = v
-                        break
-
-    # 2. Seção (Geometria Bruta)
-    secao_txt = "N/A"
-    if pilar.Representation:
-        for rep in pilar.Representation.Representations:
-            if rep.RepresentationIdentifier == 'Body':
-                for item in rep.Items:
-                    if item.is_a('IfcExtrudedAreaSolid'):
-                        perfil = item.SweptArea
-                        if perfil.is_a('IfcRectangleProfileDef'):
-                            # TQS usa metros, converte para cm
-                            dims = sorted([perfil.XDim * 100, perfil.YDim * 100])
-                            secao_txt = f"{dims[0]:.0f}x{dims[1]:.0f}"
-
-    # 3. Pavimento
-    pavimento_txt = "Térreo"
-    if pilar.ContainedInStructure:
-        pavimento_txt = pilar.ContainedInStructure[0].RelatingStructure.Name
-
-    return armadura_txt, secao_txt, pavimento_txt
+        return " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
+    
+    # 3. Se não achou, tenta ler Property Sets de texto
+    psets = ifcopenshell.util.element.get_psets(pilar)
+    for nome, dados in psets.items():
+        if 'Armadura' in nome or 'Reinforcement' in nome:
+            for k, v in dados.items():
+                if isinstance(v, str) and len(v) > 5: return v
+                
+    return "Verificar Projeto (Sem vínculo 3D)"
 
 def processar_ifc(caminho_arquivo, nome_projeto_input):
     ifc_file = ifcopenshell.open(caminho_arquivo)
@@ -148,7 +79,23 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
         guid = pilar.GlobalId
         nome = pilar.Name if pilar.Name else "S/N"
         
-        armadura, secao, pavimento = extrair_dados_tqs(pilar)
+        # Geometria (Seção)
+        secao = "N/A"
+        if pilar.Representation:
+            for rep in pilar.Representation.Representations:
+                if rep.RepresentationIdentifier == 'Body':
+                    for item in rep.Items:
+                        if item.is_a('IfcExtrudedAreaSolid'):
+                            perfil = item.SweptArea
+                            if perfil.is_a('IfcRectangleProfileDef'):
+                                dims = sorted([perfil.XDim * 100, perfil.YDim * 100])
+                                secao = f"{dims[0]:.0f}x{dims[1]:.0f}"
+
+        armadura = extrair_texto_armadura(pilar)
+        
+        pavimento = "Térreo"
+        if pilar.ContainedInStructure:
+            pavimento = pilar.ContainedInStructure[0].RelatingStructure.Name
 
         dados.append({
             'Projeto': nome_projeto_input, 
@@ -159,14 +106,15 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
             'Pavimento': pavimento,
             'Status': 'A CONFERIR', 
             'Data_Conferencia': '', 
-            'Responsavel': '',
-            'Link_PDF': ''
+            'Responsavel': ''
+            # Removemos a coluna Link_PDF para não dar erro na planilha antiga
         })
     
     dados.sort(key=lambda x: x['Nome'])
     return dados
 
 def gerar_pdf_memoria(dados_pilares, nome_projeto):
+    """Gera o PDF na memória RAM para download imediato."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     largura_pag, altura_pag = A4
@@ -179,6 +127,7 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.setLineWidth(0.5)
         c.rect(x, y, largura_etq, altura_etq)
         
+        # QR Code
         qr = qrcode.QRCode(box_size=10, border=1)
         qr.add_data(pilar['ID_Unico'])
         qr.make(fit=True)
@@ -189,6 +138,7 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.drawImage(temp_qr_path, x+2*mm, y+5*mm, width=40*mm, height=40*mm)
         os.remove(temp_qr_path)
         
+        # Textos
         c.setFont("Helvetica-Bold", 14)
         c.drawString(x+45*mm, y+35*mm, f"PILAR: {pilar['Nome']}")
         c.setFont("Helvetica", 10)
@@ -197,6 +147,7 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
         c.setFont("Helvetica-Oblique", 8)
         c.drawString(x+45*mm, y+10*mm, f"Obra: {nome_projeto[:15]}")
         
+        # Grid
         x += largura_etq + espaco
         if x + largura_etq > largura_pag - margem:
             x = margem
@@ -210,27 +161,30 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
     buffer.seek(0)
     return buffer
 
-# --- FRONTEND ---
+# --- INTERFACE WEB (STREAMLIT) ---
 
 def main():
-    st.set_page_config(page_title="Gestor Multi-Obras BIM", page_icon="🏗️")
+    st.set_page_config(page_title="Gestor BIM", page_icon="🏗️")
     
-    # LOGIN
+    # 1. LOGIN
     if 'logado' not in st.session_state: st.session_state['logado'] = False
+    
     if not st.session_state['logado']:
         st.title("🔒 Acesso Restrito")
-        s = st.text_input("Senha", type="password")
+        senha = st.text_input("Senha de Acesso", type="password")
         if st.button("Entrar"):
-            if s == "bim123":
+            if senha == "bim123":
                 st.session_state['logado'] = True
                 st.rerun()
-            else: st.error("Senha incorreta")
+            else:
+                st.error("Senha incorreta.")
         return
 
-    st.title("🏗️ Gestor Multi-Obras BIM")
+    # 2. TELA PRINCIPAL
+    st.title("🏗️ Gestor de Etiquetas BIM")
     
     with st.sidebar:
-        st.write("Usuário: Admin")
+        st.write("Status: Conectado")
         if st.button("Sair"):
             st.session_state['logado'] = False
             st.rerun()
@@ -238,59 +192,60 @@ def main():
     nome_projeto = st.text_input("Nome do Projeto / Obra", placeholder="Ex: Ed. Diogenes e Kely")
     arquivo_upload = st.file_uploader("Carregar arquivo IFC", type=["ifc"])
     
-    if arquivo_upload is not None and nome_projeto:
-        if st.button("🚀 PROCESSAR, GERAR PDF E SALVAR", type="primary"):
+    if arquivo_upload and nome_projeto:
+        if st.button("🚀 PROCESSAR DADOS", type="primary"):
             try:
-                # 1. Processar IFC
+                # Salva temporário
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
                     tmp_file.write(arquivo_upload.getvalue())
                     caminho_temp = tmp_file.name
                 
-                with st.spinner('Extraindo dados do BIM...'):
+                # A. Processamento
+                with st.spinner('Lendo IFC e extraindo dados...'):
                     novos_dados = processar_ifc(caminho_temp, nome_projeto)
                 os.remove(caminho_temp)
 
-                # 2. Gerar PDF na memória
-                with st.spinner('Gerando Etiquetas PDF...'):
-                    pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
-
-                # 3. Enviar PDF para Google Drive
-                with st.spinner(f'Enviando PDF para o Drive (Pasta ID: {ID_PASTA_DRIVE})...'):
-                    nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
-                    link_publico = enviar_pdf_drive(pdf_buffer, nome_arquivo_pdf)
-                
-                # 4. Atualizar os dados com o Link
-                for item in novos_dados:
-                    item['Link_PDF'] = link_publico
-
-                # 5. Salvar na Planilha
-                with st.spinner('Atualizando Banco de Dados...'):
+                # B. Google Sheets (Lógica de Adicionar sem apagar os outros)
+                with st.spinner('Sincronizando Banco de Dados...'):
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     ws = sh.sheet1
                     
+                    # Baixa o que já existe
                     dados_existentes = ws.get_all_records()
                     df_antigo = pd.DataFrame(dados_existentes)
                     
+                    # Remove duplicatas DO MESMO projeto (para atualizar)
                     if not df_antigo.empty and 'Projeto' in df_antigo.columns:
                         df_limpo = df_antigo[df_antigo['Projeto'] != nome_projeto]
                     else:
                         df_limpo = pd.DataFrame()
 
+                    # Junta antigo + novo
                     df_novo = pd.DataFrame(novos_dados)
                     df_final = pd.concat([df_limpo, df_novo], ignore_index=True)
                     
+                    # Sobe tudo
                     ws.clear()
                     ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
+
+                # C. Gerar PDF
+                with st.spinner('Gerando arquivo de impressão...'):
+                    pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
                 
-                st.success(f"✅ Sucesso! PDF salvo no Drive e vinculado ao projeto '{nome_projeto}'.")
-                st.markdown(f"**[Clique aqui para testar o link do PDF]({link_publico})**")
+                st.success(f"✅ Sucesso! {len(novos_dados)} pilares processados para o projeto '{nome_projeto}'.")
                 
-                pdf_buffer.seek(0)
-                st.download_button("📥 BAIXAR ETIQUETAS AGORA", pdf_buffer, nome_arquivo_pdf, "application/pdf")
+                # D. Botão de Download
+                nome_arquivo_pdf = f"Etiquetas_{nome_projeto}.pdf"
+                st.download_button(
+                    label="📥 BAIXAR PDF DAS ETIQUETAS",
+                    data=pdf_buffer,
+                    file_name=nome_arquivo_pdf,
+                    mime="application/pdf"
+                )
                 
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro no processamento: {e}")
 
 if __name__ == "__main__":
     main()
