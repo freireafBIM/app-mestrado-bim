@@ -196,7 +196,7 @@ def main():
                 st.error("Senha incorreta.")
         return
 
-    st.title("🏗️ Gestor de Etiquetas BIM")
+    st.title("🏗️ Gestor de Armaduras")
     
     with st.sidebar:
         st.write("Status: Conectado")
@@ -259,4 +259,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
