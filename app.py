@@ -20,7 +20,7 @@ ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
 # !!! COLE O ID DA PASTA DO GOOGLE DRIVE AQUI !!!
-ID_PASTA_DRIVE = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff?usp=drive_link" 
+ID_PASTA_DRIVE = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff" 
 
 # --- FUNÇÕES DE CONEXÃO ---
 
@@ -274,3 +274,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
