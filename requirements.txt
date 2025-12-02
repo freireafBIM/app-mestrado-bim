@@ -1,0 +1,8 @@
+streamlit
+pandas
+gspread
+google-auth
+ifcopenshell
+reportlab
+qrcode
+pillow
