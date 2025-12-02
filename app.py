@@ -95,7 +95,7 @@ def processar_ifc(caminho_arquivo, nome_projeto_input):
 
         # ADICIONA O NOME DO PROJETO NO DICIONÁRIO
         dados.append({
-            'Projeto': nome_projeto_input, # <--- NOVA COLUNA
+            'Projeto': nome_projeto_input, 
             'ID_Unico': guid, 
             'Nome': nome, 
             'Secao': secao,
@@ -156,21 +156,38 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto):
     buffer.seek(0)
     return buffer
 
-# --- FRONTEND ---
+# --- FRONTEND (INTERFACE WEB) ---
 
 def main():
     st.set_page_config(page_title="Gestor Multi-Obras BIM", page_icon="🏗️")
     
-    # Login Simples
-    if 'logado' not in st.session_state: st.session_state['logado'] = False
+    # --- SISTEMA DE LOGIN COM SENHA (RESTAURADO) ---
+    if 'logado' not in st.session_state:
+        st.session_state['logado'] = False
+
     if not st.session_state['logado']:
         st.title("🔒 Acesso Restrito")
-        if st.button("Entrar (Demo)"): st.session_state['logado'] = True
-        return
+        st.markdown("Área exclusiva para gestores BIM.")
+        
+        senha = st.text_input("Digite a senha de acesso:", type="password")
+        
+        if st.button("Entrar no Sistema"):
+            if senha == "bim123": # <--- SUA SENHA AQUI
+                st.session_state['logado'] = True
+                st.rerun() # Recarrega a página para entrar
+            else:
+                st.error("Senha incorreta. Tente novamente.")
+        return # Para a execução aqui se não estiver logado
 
+    # --- TELA PRINCIPAL (APÓS LOGIN) ---
     st.title("🏗️ Gestor Multi-Obras BIM")
-    st.markdown("Carregue projetos sem apagar os anteriores.")
+    st.markdown("Carregue novos projetos para a base de dados central.")
     
+    # Botão de Logout (Opcional, mas útil)
+    if st.sidebar.button("Sair / Logout"):
+        st.session_state['logado'] = False
+        st.rerun()
+
     # 1. INPUT DO NOME DO PROJETO
     nome_projeto = st.text_input("Nome do Projeto / Obra", placeholder="Ex: Ed. Diogenes e Kely")
     
@@ -187,7 +204,7 @@ def main():
                     caminho_temp = tmp_file.name
                 
                 # Processa Dados
-                with st.spinner('Lendo IFC...'):
+                with st.spinner('Lendo IFC e extraindo dados...'):
                     novos_dados = processar_ifc(caminho_temp, nome_projeto)
                 
                 # Lógica Inteligente de Banco de Dados
@@ -201,8 +218,9 @@ def main():
                     df_antigo = pd.DataFrame(dados_existentes)
                     
                     # 2. Se já tem dados, remove se houver duplicata deste mesmo projeto
-                    # (Para permitir re-upload de correção sem duplicar)
+                    # (Isso previne duplicidade se você subir o mesmo arquivo duas vezes)
                     if not df_antigo.empty and 'Projeto' in df_antigo.columns:
+                        # Mantém tudo que NÃO é do projeto atual
                         df_limpo = df_antigo[df_antigo['Projeto'] != nome_projeto]
                     else:
                         df_limpo = pd.DataFrame()
@@ -216,18 +234,20 @@ def main():
                     ws.update([df_final.columns.values.tolist()] + df_final.values.tolist())
                 
                 # Gera PDF
-                with st.spinner('Gerando Etiquetas...'):
+                with st.spinner('Gerando arquivo de Etiquetas...'):
                     pdf_buffer = gerar_pdf_memoria(novos_dados, nome_projeto)
                 
-                st.success(f"✅ Projeto '{nome_projeto}' atualizado! Total de pilares na base: {len(df_final)}")
+                st.success(f"✅ Projeto '{nome_projeto}' atualizado com sucesso!")
+                st.metric(label="Total de Pilares na Base", value=len(df_final), delta=len(novos_dados))
                 
                 st.download_button("📥 BAIXAR ETIQUETAS (PDF)", pdf_buffer, f"Etiquetas_{nome_projeto}.pdf", "application/pdf")
                 os.remove(caminho_temp)
                 
             except Exception as e:
-                st.error(f"Erro: {e}")
+                st.error(f"Erro durante o processamento: {e}")
+                
     elif arquivo_upload and not nome_projeto:
-        st.warning("⚠️ Por favor, digite o nome do projeto antes de processar.")
+        st.warning("⚠️ Atenção: Você precisa digitar o nome do projeto antes de processar.")
 
 if __name__ == "__main__":
     main()
