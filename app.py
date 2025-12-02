@@ -45,33 +45,60 @@ def conectar_google_sheets():
     return client
 
 def enviar_pdf_drive(pdf_buffer, nome_arquivo):
-    """Envia o PDF DIRETAMENTE para a pasta compartilhada pelo ID."""
+    """Envia o PDF com Debug para encontrar o erro."""
     creds = obter_credenciais()
     service = build('drive', 'v3', credentials=creds)
     
-    # Metadados do arquivo: Nome e PASTA PAI (O ID que você colou)
+    # --- ÁREA DE DEBUG (PARA VOCÊ VER NA TELA) ---
+    # Coloque o ID da pasta DIRETAMENTE AQUI, entre aspas.
+    # Não use variáveis globais agora, vamos garantir que funcione.
+    REAL_ID_PASTA = "1I37hXwx6zpIGItxpM_guTQFEls-W8gff"  # <--- COLE SEU ID AQUI DE NOVO
+    
+    st.warning(f"DEBUG: Tentando enviar para a pasta ID: {REAL_ID_PASTA}")
+    
+    # Verifica se o ID está vazio
+    if not REAL_ID_PASTA or "COLE_O_ID" in REAL_ID_PASTA:
+        st.error("ERRO CRÍTICO: O ID da pasta não foi configurado no código!")
+        return None
+
+    # Metadados com PARENTS explícito
     file_metadata = {
         'name': nome_arquivo,
-        'parents': [ID_PASTA_DRIVE] # <--- O SEGREDO ESTÁ AQUI
+        'parents': [REAL_ID_PASTA]  # Isso obriga a salvar na pasta compartilhada
     }
     
     media = MediaIoBaseUpload(pdf_buffer, mimetype='application/pdf', resumable=True)
     
-    # Cria o arquivo
-    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-    file_id = file.get('id')
-    web_link = file.get('webViewLink')
-    
-    # Deixar público para leitura (para o AppSheet abrir)
     try:
+        # Tenta criar o arquivo suportando todos os tipos de drive
+        file = service.files().create(
+            body=file_metadata, 
+            media_body=media, 
+            fields='id, webViewLink',
+            supportsAllDrives=True
+        ).execute()
+        
+        file_id = file.get('id')
+        web_link = file.get('webViewLink')
+        
+        st.success(f"Arquivo criado! ID: {file_id}")
+        
+        # Permissões
         service.permissions().create(
             fileId=file_id,
             body={'role': 'reader', 'type': 'anyone'}
         ).execute()
-    except:
-        pass # Se der erro de permissão aqui, geralmente o link ainda funciona para quem tem acesso
-    
-    return web_link
+        
+        return web_link
+        
+    except Exception as e:
+        # Se der erro, mostra o detalhe técnico na tela
+        st.error(f"O Google recusou o upload. Detalhe: {e}")
+        # Se o erro for de cota, confirma que ele ignorou o PARENTS
+        if "storageQuotaExceeded" in str(e):
+            st.error("DIAGNÓSTICO: O sistema ignorou o ID da pasta e tentou salvar na raiz do Robô.")
+            st.error("Verifique se o ID da pasta está correto e se o Robô é EDITOR dela.")
+        raise e
 
 # --- FUNÇÕES DE LÓGICA DE NEGÓCIO ---
 
@@ -274,3 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
