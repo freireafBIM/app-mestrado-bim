@@ -12,6 +12,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 import io
 import datetime
+import re # Biblioteca de Expressões Regulares (para ler o texto do TQS)
 
 # --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
@@ -45,32 +46,66 @@ def limpar_string(texto):
 # --- LÓGICA DE EXTRAÇÃO  (TQS) ---
 
 def extrair_texto_armadura(pilar):
-    """Conta as barras 3D ou lê propriedades de texto."""
-    barras = []
-    # 1. Busca por geometria 3D (IfcReinforcingBar)
+    """
+    Lê as armaduras exportadas pelo TQS como objetos IfcReinforcingBar.
+    Interpreta o texto '1 N10 ø10.0 C=...' gravado no nome da barra.
+    """
+    # Dicionário para somar as barras: { '10.0': 4, '5.0': 12 }
+    contagem_bitolas = {}
+    
+    # 1. Busca objetos de armadura conectados ao pilar
+    # O TQS conecta as barras ao pilar através da relação 'IfcRelAggregates'
     relacoes = getattr(pilar, 'IsDecomposedBy', [])
+    
+    encontrou_barras = False
+    
     for rel in relacoes:
         if rel.is_a('IfcRelAggregates'):
             for obj in rel.RelatedObjects:
                 if obj.is_a('IfcReinforcingBar'):
-                    # Converte diâmetro para mm (IFC costuma usar metros)
-                    d = round(obj.NominalDiameter * 1000, 1)
-                    barras.append(d)
+                    encontrou_barras = True
+                    nome_bruto = obj.Name # Ex: "1 P4 \X\D85.00 C=84.00"
+                    
+                    # Tenta extrair o diâmetro usando "Regex" (busca padrões de texto)
+                    # Procura por "\X\D8" seguido de números (ex: 5.00 ou 10.00)
+                    match = re.search(r'\\X\\D8\s*([0-9\.]+)', nome_bruto)
+                    
+                    if match:
+                        diametro = float(match.group(1)) # Pega o número (5.00)
+                        # Arredonda para ficar bonito (10.0, 12.5, 5.0)
+                        diametro_str = f"{diametro:.1f}" 
+                        
+                        # Adiciona na contagem
+                        qt_atual = contagem_bitolas.get(diametro_str, 0)
+                        contagem_bitolas[diametro_str] = qt_atual + 1
+                    else:
+                        # Se não achou no nome, tenta pegar da propriedade física (fallback)
+                        if hasattr(obj, "NominalDiameter"):
+                             # IFC usa metros, converte para mm
+                            d = round(obj.NominalDiameter * 1000, 1)
+                            d_str = f"{d:.1f}"
+                            contagem_bitolas[d_str] = contagem_bitolas.get(d_str, 0) + 1
+
+    # 2. Formata o texto final (Ex: "4 ø10.0 + 12 ø5.0")
+    if not encontrou_barras:
+        # Tenta ler Psets de texto se não tiver objetos 3D (Plano C)
+        psets = ifcopenshell.util.element.get_psets(pilar)
+        for nome, dados in psets.items():
+            if 'Armadura' in nome or 'Reinforcement' in nome:
+                for k, v in dados.items():
+                    if isinstance(v, str) and len(v) > 5: return v
+        return "Verificar Detalhamento (Sem barras vinculadas)"
     
-    # 2. Se achou barras 3D, resume (Ex: 4 ø10.0)
-    if barras:
-        from collections import Counter
-        c = Counter(barras)
-        return " + ".join([f"{qtd} ø{diam}" for diam, qtd in c.items()])
+    # Monta a string resumo ordenando por bitola (grossas primeiro)
+    textos = []
+    # Ordena as bitolas (converter para float para ordenar corretamente: 10.0 > 5.0)
+    bitolas_ordenadas = sorted(contagem_bitolas.keys(), key=lambda x: float(x), reverse=True)
     
-    # 3. Fallback: Tenta ler Psets se não houver 3D
-    psets = ifcopenshell.util.element.get_psets(pilar)
-    for nome, dados in psets.items():
-        if 'Armadura' in nome or 'Reinforcement' in nome:
-            for k, v in dados.items():
-                if isinstance(v, str) and len(v) > 5: return v
-                
-    return "Verificar Projeto (Sem vínculo 3D)"
+    for diam in bitolas_ordenadas:
+        qtd = contagem_bitolas[diam]
+        textos.append(f"{qtd} ø{diam}")
+        
+    return " + ".join(textos)
 
 def extrair_secao_robusta(pilar):
     """
@@ -306,4 +341,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
