@@ -61,6 +61,58 @@ def extrair_texto_armadura(pilar):
                 if isinstance(v, str) and len(v) > 5: return v
     return "Verificar Projeto (Sem vínculo 3D)"
 
+def extrair_secao_robusta(pilar):
+    """
+    Tenta extrair a seção (Ex: 14x30) de várias fontes, priorizando o TQS.
+    """
+    psets = ifcopenshell.util.element.get_psets(pilar)
+    b_val, h_val = 0, 0
+    encontrou = False
+
+    # 1. TENTATIVA TQS (Pset TQS_Geometria)
+    if 'TQS_Geometria' in psets:
+        dados = psets['TQS_Geometria']
+        # TQS costuma usar Dimensao_b1 e Dimensao_h1
+        b = dados.get('Dimensao_b1') or dados.get('B')
+        h = dados.get('Dimensao_h1') or dados.get('H')
+        if b and h:
+            b_val, h_val = float(b), float(h)
+            encontrou = True
+
+    # 2. TENTATIVA GENÉRICA (Pset Dimensions ou Common)
+    if not encontrou:
+        for nome_pset, dados in psets.items():
+            if 'Dimension' in nome_pset or 'Common' in nome_pset:
+                b = dados.get('Width') or dados.get('b')
+                h = dados.get('Depth') or dados.get('h') or dados.get('Length')
+                if b and h and isinstance(b, (int, float)) and isinstance(h, (int, float)):
+                    b_val, h_val = float(b), float(h)
+                    encontrou = True
+                    break
+
+    # 3. TENTATIVA GEOMETRIA 3D (ExtrudedAreaSolid)
+    if not encontrou and pilar.Representation:
+        for rep in pilar.Representation.Representations:
+            if rep.RepresentationIdentifier == 'Body':
+                for item in rep.Items:
+                    if item.is_a('IfcExtrudedAreaSolid'):
+                        perfil = item.SweptArea
+                        if perfil.is_a('IfcRectangleProfileDef'):
+                            b_val = perfil.XDim
+                            h_val = perfil.YDim
+                            encontrou = True
+
+    if encontrou:
+        # Tratamento de Unidades (Metros vs Centímetros)
+        # Se for menor que 4.0, assumimos que está em metros e convertemos
+        if b_val < 4.0: b_val *= 100
+        if h_val < 4.0: h_val *= 100
+        
+        dims = sorted([b_val, h_val])
+        return f"{dims[0]:.0f}x{dims[1]:.0f}"
+    
+    return "N/A"
+
 def processar_ifc(caminho_arquivo, id_projeto_input):
     ifc_file = ifcopenshell.open(caminho_arquivo)
     pilares = ifc_file.by_type('IfcColumn')
@@ -85,23 +137,14 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
         # CHAVE ÚNICA DO PILAR (ID Composto)
         id_unico_pilar = f"{guid}-{sufixo_pav}-{id_projeto_input}"
 
-        # Geometria
-        secao = "N/A"
-        if pilar.Representation:
-            for rep in pilar.Representation.Representations:
-                if rep.RepresentationIdentifier == 'Body':
-                    for item in rep.Items:
-                        if item.is_a('IfcExtrudedAreaSolid'):
-                            perfil = item.SweptArea
-                            if perfil.is_a('IfcRectangleProfileDef'):
-                                dims = sorted([perfil.XDim * 100, perfil.YDim * 100])
-                                secao = f"{dims[0]:.0f}x{dims[1]:.0f}"
+        # Extração Robusta da Seção (CORREÇÃO AQUI)
+        secao = extrair_secao_robusta(pilar)
 
         armadura = extrair_texto_armadura(pilar)
 
         dados.append({
-            'ID_Unico': id_unico_pilar,   # Chave Primária da Tabela Pilares
-            'Projeto_Ref': id_projeto_input, # Chave Estrangeira (Vínculo com a Tabela Projetos)
+            'ID_Unico': id_unico_pilar,   
+            'Projeto_Ref': id_projeto_input, 
             'Nome': nome, 
             'Secao': secao,
             'Armadura': armadura, 
@@ -179,7 +222,6 @@ def main():
     
     # Inputs
     nome_projeto_legivel = st.text_input("Nome da Obra (Legível)", placeholder="Ex: Edifício Diogenes")
-    # Cria um ID técnico para o banco de dados (sem espaços)
     id_projeto = limpar_string(nome_projeto_legivel)
     
     if nome_projeto_legivel:
@@ -194,31 +236,25 @@ def main():
                     tmp_file.write(arquivo_upload.getvalue())
                     caminho_temp = tmp_file.name
                 
-                # 1. Processar Pilares
+                # 1. Processar Pilares (COM CORREÇÃO DE SEÇÃO)
                 with st.spinner('Lendo IFC...'):
                     dados_pilares = processar_ifc(caminho_temp, id_projeto)
                 os.remove(caminho_temp)
 
-                # 2. Atualizar Google Sheets (2 Tabelas)
-                with st.spinner('Sincronizando Tabelas (Projetos e Pilares)...'):
+                # 2. Atualizar Google Sheets
+                with st.spinner('Sincronizando Tabelas...'):
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     
-                    # --- ATUALIZA TABELA PROJETOS ---
-                    try:
-                        ws_proj = sh.worksheet("Projetos")
-                    except:
-                        ws_proj = sh.add_worksheet("Projetos", 100, 5)
-
-                    # Lê projetos existentes
+                    # Tabela PROJETOS
+                    try: ws_proj = sh.worksheet("Projetos")
+                    except: ws_proj = sh.add_worksheet("Projetos", 100, 5)
+                    
                     lista_proj = ws_proj.get_all_records()
                     df_proj = pd.DataFrame(lista_proj)
-                    
-                    # Remove se já existe esse projeto (para atualizar dados)
                     if not df_proj.empty and 'ID_Projeto' in df_proj.columns:
                         df_proj = df_proj[df_proj['ID_Projeto'] != id_projeto]
                     
-                    # Cria linha do novo projeto
                     novo_proj = {
                         'ID_Projeto': id_projeto,
                         'Nome_Obra': nome_projeto_legivel,
@@ -229,23 +265,17 @@ def main():
                     ws_proj.clear()
                     ws_proj.update([df_proj_final.columns.values.tolist()] + df_proj_final.values.tolist())
 
-                    # --- ATUALIZA TABELA PILARES ---
-                    try:
-                        ws_pil = sh.worksheet("Pilares")
-                    except:
-                        ws_pil = sh.add_worksheet("Pilares", 1000, 10)
+                    # Tabela PILARES
+                    try: ws_pil = sh.worksheet("Pilares")
+                    except: ws_pil = sh.add_worksheet("Pilares", 1000, 10)
                     
                     lista_pil = ws_pil.get_all_records()
                     df_pil = pd.DataFrame(lista_pil)
-                    
-                    # Remove pilares antigos DESTE projeto específico
                     if not df_pil.empty and 'Projeto_Ref' in df_pil.columns:
                         df_pil = df_pil[df_pil['Projeto_Ref'] != id_projeto]
                     
-                    # Adiciona novos
                     df_pil_novos = pd.DataFrame(dados_pilares)
                     df_pil_final = pd.concat([df_pil, df_pil_novos], ignore_index=True)
-                    
                     ws_pil.clear()
                     ws_pil.update([df_pil_final.columns.values.tolist()] + df_pil_final.values.tolist())
 
