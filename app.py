@@ -12,146 +12,146 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 import io
 import datetime
-import re # Biblioteca de Expressões Regulares (para ler o texto do TQS)
+import re
 
 # --- CONFIGURAÇÕES ---
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
+# --- CACHE GLOBAL PARA OTIMIZAR ---
+CACHE_ARMADURAS = {}
+
 # --- FUNÇÕES DE CONEXÃO ---
 def conectar_google_sheets():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    
-    # Tenta conectar via Secrets (Nuvem) ou Arquivo Local
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
         creds_dict = st.secrets["gcp_service_account"]
         creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     elif os.path.exists(ARQUIVO_CREDENCIAIS):
         creds = Credentials.from_service_account_file(ARQUIVO_CREDENCIAIS, scopes=scopes)
     else:
-        st.error("ERRO CRÍTICO: Credenciais não encontradas (JSON ou Secrets).")
+        st.error("Credenciais não encontradas.")
         st.stop()
-        return None
+    return gspread.authorize(creds)
 
-    client = gspread.authorize(creds)
-    return client
-
-# --- FUNÇÕES AUXILIARES ---
 def limpar_string(texto):
-    """Remove caracteres especiais para criar IDs seguros."""
     if not texto: return "X"
-    # Mantém apenas letras e números e converte para maiúsculo
     return "".join(e for e in str(texto) if e.isalnum()).upper()
 
-# --- LÓGICA DE EXTRAÇÃO  (TQS) ---
-
-def extrair_texto_armadura(pilar):
-    """
-    Lê as armaduras exportadas pelo TQS como objetos IfcReinforcingBar.
-    Interpreta o texto '1 N10 ø10.0 C=...' gravado no nome da barra.
-    """
-    # Dicionário para somar as barras: { '10.0': 4, '5.0': 12 }
-    contagem_bitolas = {}
+# --- NOVA LÓGICA DE ARMADURA (GLOBAL MATCH) ---
+def pre_carregar_armaduras(ifc_file):
+    """Lê todas as barras do arquivo DE UMA VEZ e organiza por dono (P1, P2...)."""
+    global CACHE_ARMADURAS
+    CACHE_ARMADURAS = {}
     
-    # 1. Busca objetos de armadura conectados ao pilar
-    # O TQS conecta as barras ao pilar através da relação 'IfcRelAggregates'
-    relacoes = getattr(pilar, 'IsDecomposedBy', [])
+    # Pega todas as barras do projeto inteiro
+    barras = ifc_file.by_type('IfcReinforcingBar')
     
-    encontrou_barras = False
-    
-    for rel in relacoes:
-        if rel.is_a('IfcRelAggregates'):
-            for obj in rel.RelatedObjects:
-                if obj.is_a('IfcReinforcingBar'):
-                    encontrou_barras = True
-                    nome_bruto = obj.Name # Ex: "1 P4 \X\D85.00 C=84.00"
-                    
-                    # Tenta extrair o diâmetro usando "Regex" (busca padrões de texto)
-                    # Procura por "\X\D8" seguido de números (ex: 5.00 ou 10.00)
-                    match = re.search(r'\\X\\D8\s*([0-9\.]+)', nome_bruto)
-                    
-                    if match:
-                        diametro = float(match.group(1)) # Pega o número (5.00)
-                        # Arredonda para ficar bonito (10.0, 12.5, 5.0)
-                        diametro_str = f"{diametro:.1f}" 
-                        
-                        # Adiciona na contagem
-                        qt_atual = contagem_bitolas.get(diametro_str, 0)
-                        contagem_bitolas[diametro_str] = qt_atual + 1
-                    else:
-                        # Se não achou no nome, tenta pegar da propriedade física (fallback)
-                        if hasattr(obj, "NominalDiameter"):
-                             # IFC usa metros, converte para mm
-                            d = round(obj.NominalDiameter * 1000, 1)
-                            d_str = f"{d:.1f}"
-                            contagem_bitolas[d_str] = contagem_bitolas.get(d_str, 0) + 1
-
-    # 2. Formata o texto final (Ex: "4 ø10.0 + 12 ø5.0")
-    if not encontrou_barras:
-        # Tenta ler Psets de texto se não tiver objetos 3D (Plano C)
-        psets = ifcopenshell.util.element.get_psets(pilar)
-        for nome, dados in psets.items():
-            if 'Armadura' in nome or 'Reinforcement' in nome:
-                for k, v in dados.items():
-                    if isinstance(v, str) and len(v) > 5: return v
-        return "Verificar Detalhamento (Sem barras vinculadas)"
-    
-    # Monta a string resumo ordenando por bitola (grossas primeiro)
-    textos = []
-    # Ordena as bitolas (converter para float para ordenar corretamente: 10.0 > 5.0)
-    bitolas_ordenadas = sorted(contagem_bitolas.keys(), key=lambda x: float(x), reverse=True)
-    
-    for diam in bitolas_ordenadas:
-        qtd = contagem_bitolas[diam]
-        textos.append(f"{qtd} ø{diam}")
+    for bar in barras:
+        nome_completo = bar.Name # Ex: "1 P1 \X\D810.00 C=280.00"
+        if not nome_completo: continue
         
-    return " + ".join(textos)
+        # Tenta achar o nome do elemento no texto da barra
+        # Procura padrão: Número + Espaço + Pxxx + Espaço
+        # Ex: "1 P4 " -> Pega "P4"
+        match_nome = re.search(r'^\d+\s+(P\d+)\s+', nome_completo)
+        
+        if match_nome:
+            nome_elemento = match_nome.group(1) # "P4"
+            
+            # Extrai Bitola
+            match_bitola = re.search(r'\\X\\D8\s*([0-9\.]+)', nome_completo)
+            bitola = 0.0
+            if match_bitola:
+                bitola = float(match_bitola.group(1))
+            else:
+                # Tenta propriedade física
+                if hasattr(bar, "NominalDiameter") and bar.NominalDiameter:
+                    bitola = bar.NominalDiameter * 1000
+            
+            if bitola > 0:
+                if nome_elemento not in CACHE_ARMADURAS:
+                    CACHE_ARMADURAS[nome_elemento] = []
+                CACHE_ARMADURAS[nome_elemento].append(bitola)
 
-def extrair_secao_robusta(pilar):
-    """
-    Tenta extrair a seção (Ex: 14x30) priorizando dados do TQS
-    e usando geometria bruta como backup.
-    """
+def get_armadura_pilar(nome_pilar):
+    """Busca a armadura no cache pelo nome do pilar (ex: P4)."""
+    # Tenta match exato
+    lista_bitolas = CACHE_ARMADURAS.get(nome_pilar)
+    
+    if not lista_bitolas:
+        return "Não detalhado / Sem barras 3D"
+        
+    from collections import Counter
+    c = Counter(lista_bitolas)
+    # Ordena decrescente
+    return " + ".join([f"{qtd} ø{diam:.1f}" for diam, qtd in sorted(c.items(), reverse=True)])
+
+# --- NOVA LÓGICA DE GEOMETRIA (BOUNDING BOX) ---
+def extrair_secao_universal(pilar):
+    """Mede a geometria 3D ponto a ponto (funciona para qualquer formato)."""
+    # 1. Tenta Psets TQS (Mais rápido/preciso se existir)
     psets = ifcopenshell.util.element.get_psets(pilar)
-    b_val, h_val = 0, 0
-    encontrou = False
-
-    # 1. TENTATIVA TQS (Pset TQS_Geometria)
     if 'TQS_Geometria' in psets:
-        dados = psets['TQS_Geometria']
-        # TQS usa 'Dimensao_b1' e 'Dimensao_h1'
-        b = dados.get('Dimensao_b1') or dados.get('B')
-        h = dados.get('Dimensao_h1') or dados.get('H')
+        d = psets['TQS_Geometria']
+        b = d.get('Dimensao_b1') or d.get('B')
+        h = d.get('Dimensao_h1') or d.get('H')
         if b and h:
-            b_val, h_val = float(b), float(h)
-            encontrou = True
+            vals = sorted([float(b), float(h)])
+            if vals[0] < 2.0: vals = [v*100 for v in vals] # Converte m para cm
+            return f"{vals[0]:.0f}x{vals[1]:.0f}"
 
-    # 2. TENTATIVA GENÉRICA (ExtrudedAreaSolid)
-    if not encontrou and pilar.Representation:
-        for rep in pilar.Representation.Representations:
-            if rep.RepresentationIdentifier == 'Body':
-                for item in rep.Items:
-                    if item.is_a('IfcExtrudedAreaSolid'):
-                        perfil = item.SweptArea
-                        if perfil.is_a('IfcRectangleProfileDef'):
-                            b_val = perfil.XDim
-                            h_val = perfil.YDim
-                            encontrou = True
-
-    if encontrou:
-        # Tratamento de Unidades: Se for pequeno (< 4.0), assume metros e converte p/ cm
-        if b_val < 4.0: b_val *= 100
-        if h_val < 4.0: h_val *= 100
-        
-        # Ordena sempre Menor x Maior para padronizar (Ex: 14x30)
-        dims = sorted([b_val, h_val])
-        return f"{dims[0]:.0f}x{dims[1]:.0f}"
+    # 2. Força Bruta: Bounding Box 3D
+    # Coleta todos os pontos cartesianos que formam o pilar
+    if not pilar.Representation: return "N/A"
     
+    pontos_x = []
+    pontos_y = []
+    
+    # Função recursiva para achar pontos escondidos em malhas
+    def buscar_pontos(item):
+        if item.is_a('IfcCartesianPoint'):
+            if len(item.Coordinates) >= 2:
+                pontos_x.append(item.Coordinates[0])
+                pontos_y.append(item.Coordinates[1])
+        # Navega para dentro das estruturas
+        if hasattr(item, 'Points'): 
+            for p in item.Points: buscar_pontos(p)
+        if hasattr(item, 'OuterCurve'): buscar_pontos(item.OuterCurve)
+        if hasattr(item, 'PolygonalBoundary'): buscar_pontos(item.PolygonalBoundary)
+        if hasattr(item, 'FbsmFaces'): # Malha TQS
+            for face in item.FbsmFaces: buscar_pontos(face)
+        if hasattr(item, 'CfsFaces'): 
+            for face in item.CfsFaces: buscar_pontos(face)
+        if hasattr(item, 'Bounds'): 
+            for b in item.Bounds: buscar_pontos(b)
+            
+    for rep in pilar.Representation.Representations:
+        if rep.RepresentationIdentifier in ['Body', 'Mesh']:
+            for item in rep.Items:
+                buscar_pontos(item)
+    
+    if pontos_x and pontos_y:
+        largura = max(pontos_x) - min(pontos_x)
+        altura = max(pontos_y) - min(pontos_y)
+        
+        # Ajuste de unidade (metros para cm)
+        if largura < 2.0: largura *= 100
+        if altura < 2.0: altura *= 100
+        
+        # Arredonda e ordena
+        dims = sorted([largura, altura])
+        # Tolerância para arredondamento (ex: 13.99 vira 14)
+        return f"{dims[0]:.0f}x{dims[1]:.0f}"
+        
     return "N/A"
 
 def processar_ifc(caminho_arquivo, id_projeto_input):
-    """Lê o IFC e gera a lista de dados com Chaves Primárias Robustas."""
     ifc_file = ifcopenshell.open(caminho_arquivo)
+    
+    # 1. INDEXAÇÃO GLOBAL DAS ARMADURAS (O Segredo!)
+    pre_carregar_armaduras(ifc_file)
+    
     pilares = ifc_file.by_type('IfcColumn')
     dados = []
     
@@ -164,27 +164,24 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
         guid = pilar.GlobalId
         nome = pilar.Name if pilar.Name else "S/N"
         
-        # Identifica Pavimento
         pavimento = "Térreo"
         if pilar.ContainedInStructure:
             pavimento = pilar.ContainedInStructure[0].RelatingStructure.Name
         
-        # Limpa textos para usar no ID
         sufixo_pav = limpar_string(pavimento)
         sufixo_nome = limpar_string(nome)
-
-        # --- CHAVE PRIMÁRIA ROBUSTA (A CORREÇÃO PRINCIPAL) ---
-        # Formato: NOME - GUID - PAVIMENTO - PROJETO
-        # Isso impede que P1 seja confundido com P12 ou P1 de outro andar
         id_unico_pilar = f"{sufixo_nome}-{guid}-{sufixo_pav}-{id_projeto_input}"
 
-        secao = extrair_secao_robusta(pilar)
-        armadura = extrair_texto_armadura(pilar)
+        # Usar as novas funções "Universais"
+        secao = extrair_secao_universal(pilar)
+        
+        # Pega armadura buscando pelo NOME (P1, P2...)
+        armadura = get_armadura_pilar(nome)
 
         dados.append({
-            'ID_Unico': id_unico_pilar,      # Chave Única (Key)
-            'Projeto_Ref': id_projeto_input, # Chave Estrangeira (Ref)
-            'Nome': nome,                    # Label
+            'ID_Unico': id_unico_pilar,   
+            'Projeto_Ref': id_projeto_input, 
+            'Nome': nome, 
             'Secao': secao,
             'Armadura': armadura, 
             'Pavimento': pavimento,
@@ -193,32 +190,26 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
             'Responsavel': ''
         })
     
-    # Ordena visualmente por Pavimento e Nome
     dados.sort(key=lambda x: (x['Pavimento'], x['Nome']))
     return dados
 
 def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
-    """Gera o PDF com etiquetas na memória RAM."""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
     largura_pag, altura_pag = A4
     largura_etq, altura_etq = 90*mm, 50*mm
     margem, espaco = 10*mm, 5*mm
-    
     x, y = margem, altura_pag - margem - altura_etq
     
     for pilar in dados_pilares:
         c.setLineWidth(0.5)
         c.rect(x, y, largura_etq, altura_etq)
-        
-        # Gera QR Code contendo o ID ÚNICO ROBUSTO
         qr = qrcode.QRCode(box_size=10, border=1)
         qr.add_data(pilar['ID_Unico'])
         qr.make(fit=True)
         img_qr = qr.make_image(fill_color="black", back_color="white")
         temp_qr_path = f"temp_{pilar['ID_Unico'][:5]}.png"
         img_qr.save(temp_qr_path)
-        
         c.drawImage(temp_qr_path, x+2*mm, y+5*mm, width=40*mm, height=40*mm)
         os.remove(temp_qr_path)
         
@@ -239,19 +230,13 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
             c.showPage()
             x = margem
             y = altura_pag - margem - altura_etq
-            
     c.save()
     buffer.seek(0)
     return buffer
 
-# --- FRONTEND (INTERFACE) ---
-
 def main():
-    st.set_page_config(page_title="Sistema Conferência Armaduras", page_icon="🏗️")
-    
-    # Login
+    st.set_page_config(page_title="Gestor BIM", page_icon="🏗️")
     if 'logado' not in st.session_state: st.session_state['logado'] = False
-    
     if not st.session_state['logado']:
         st.title("🔒 Acesso Restrito")
         s = st.text_input("Senha", type="password")
@@ -262,84 +247,56 @@ def main():
             else: st.error("Senha incorreta")
         return
 
-    st.title("🏗️ Sistema Conferência Armaduras")
-    
-    # Inputs
-    nome_projeto_legivel = st.text_input("Nome da Obra (Legível)", placeholder="Ex: Edifício Diogenes")
-    # Cria ID técnico (Ex: EDIFICIODIOGENES)
+    st.title("🏗️ Gestor BIM (Relacional)")
+    nome_projeto_legivel = st.text_input("Nome da Obra", placeholder="Ex: Edifício Diogenes")
     id_projeto = limpar_string(nome_projeto_legivel)
-    
-    if nome_projeto_legivel:
-        st.caption(f"ID Técnico do Projeto: {id_projeto}")
-
-    arquivo_upload = st.file_uploader("Carregar arquivo IFC", type=["ifc"])
+    arquivo_upload = st.file_uploader("Carregar IFC", type=["ifc"])
     
     if arquivo_upload and nome_projeto_legivel:
-        if st.button("🚀 PROCESSAR E SINCRONIZAR", type="primary"):
+        if st.button("🚀 PROCESSAR", type="primary"):
             try:
-                # Salva IFC temporário
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp_file:
                     tmp_file.write(arquivo_upload.getvalue())
                     caminho_temp = tmp_file.name
                 
-                # 1. Processar Pilares (Extração)
-                with st.spinner('Lendo IFC e gerando IDs Únicos...'):
+                with st.spinner('Lendo IFC e Armaduras...'):
                     dados_pilares = processar_ifc(caminho_temp, id_projeto)
                 os.remove(caminho_temp)
 
-                # 2. Atualizar Google Sheets
-                with st.spinner('Sincronizando Tabelas (Projetos e Pilares)...'):
+                with st.spinner('Atualizando Banco de Dados...'):
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     
-                    # --- TABELA PROJETOS ---
                     try: ws_proj = sh.worksheet("Projetos")
                     except: ws_proj = sh.add_worksheet("Projetos", 100, 5)
-                    
                     lista_proj = ws_proj.get_all_records()
                     df_proj = pd.DataFrame(lista_proj)
-                    # Remove duplicata do projeto atual
                     if not df_proj.empty and 'ID_Projeto' in df_proj.columns:
                         df_proj = df_proj[df_proj['ID_Projeto'] != id_projeto]
-                    
-                    novo_proj = {
-                        'ID_Projeto': id_projeto,
-                        'Nome_Obra': nome_projeto_legivel,
-                        'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
-                        'Total_Pilares': len(dados_pilares)
-                    }
+                    novo_proj = {'ID_Projeto': id_projeto, 'Nome_Obra': nome_projeto_legivel, 'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y"), 'Total_Pilares': len(dados_pilares)}
                     df_proj_final = pd.concat([df_proj, pd.DataFrame([novo_proj])], ignore_index=True)
                     ws_proj.clear()
                     ws_proj.update([df_proj_final.columns.values.tolist()] + df_proj_final.values.tolist())
 
-                    # --- TABELA PILARES ---
                     try: ws_pil = sh.worksheet("Pilares")
                     except: ws_pil = sh.add_worksheet("Pilares", 1000, 10)
-                    
                     lista_pil = ws_pil.get_all_records()
                     df_pil = pd.DataFrame(lista_pil)
-                    
-                    # Remove APENAS os pilares deste projeto específico (Limpeza)
                     if not df_pil.empty and 'Projeto_Ref' in df_pil.columns:
                         df_pil = df_pil[df_pil['Projeto_Ref'] != id_projeto]
-                    
                     df_pil_novos = pd.DataFrame(dados_pilares)
                     df_pil_final = pd.concat([df_pil, df_pil_novos], ignore_index=True)
-                    
                     ws_pil.clear()
                     ws_pil.update([df_pil_final.columns.values.tolist()] + df_pil_final.values.tolist())
 
-                # 3. PDF
-                with st.spinner('Gerando Etiquetas PDF...'):
+                with st.spinner('Gerando PDF...'):
                     pdf_buffer = gerar_pdf_memoria(dados_pilares, nome_projeto_legivel)
                 
-                st.success(f"✅ Projeto '{nome_projeto_legivel}' atualizado com sucesso!")
-                st.download_button("📥 BAIXAR PDF DAS ETIQUETAS", pdf_buffer, f"Etiquetas_{id_projeto}.pdf", "application/pdf")
+                st.success(f"✅ Projeto '{nome_projeto_legivel}' processado! {len(dados_pilares)} pilares encontrados.")
+                st.download_button("📥 BAIXAR PDF", pdf_buffer, f"Etiquetas_{id_projeto}.pdf", "application/pdf")
                 
             except Exception as e:
                 st.error(f"Erro: {e}")
 
 if __name__ == "__main__":
     main()
-
-
