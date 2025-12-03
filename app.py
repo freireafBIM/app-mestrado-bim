@@ -42,7 +42,7 @@ def limpar_string(texto):
     # Mantém apenas letras e números e converte para maiúsculo
     return "".join(e for e in str(texto) if e.isalnum()).upper()
 
-# --- LÓGICA DE EXTRAÇÃO BIM (TQS) ---
+# --- LÓGICA DE EXTRAÇÃO  (TQS) ---
 
 def extrair_texto_armadura(pilar):
     """Conta as barras 3D ou lê propriedades de texto."""
@@ -212,7 +212,7 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
 # --- FRONTEND (INTERFACE) ---
 
 def main():
-    st.set_page_config(page_title="Gestor BIM", page_icon="🏗️")
+    st.set_page_config(page_title="Sistema Conferência Armaduras", page_icon="🏗️")
     
     # Login
     if 'logado' not in st.session_state: st.session_state['logado'] = False
@@ -227,7 +227,7 @@ def main():
             else: st.error("Senha incorreta")
         return
 
-    st.title("🏗️ Gestor BIM (Relacional)")
+    st.title("🏗️ Sistema Conferência Armaduras")
     
     # Inputs
     nome_projeto_legivel = st.text_input("Nome da Obra (Legível)", placeholder="Ex: Edifício Diogenes")
@@ -306,3 +306,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
