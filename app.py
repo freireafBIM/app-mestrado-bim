@@ -97,8 +97,8 @@ def obter_armadura_do_cache(nome_pilar):
     return " + ".join([f"{qtd} ø{diam:.1f}" for diam, qtd in sorted(c.items(), reverse=True)])
 
 def extrair_secao_universal(pilar):
-    """Mede a geometria 3D ponto a ponto (Bounding Box)."""
-    # Tenta Psets primeiro
+    """Mede a geometria 3D ponto a ponto (Bounding Box) - VERSÃO CORRIGIDA."""
+    # 1. Tenta Psets TQS primeiro
     psets = ifcopenshell.util.element.get_psets(pilar)
     if 'TQS_Geometria' in psets:
         d = psets['TQS_Geometria']
@@ -109,10 +109,67 @@ def extrair_secao_universal(pilar):
             if vals[0] < 3.0: vals = [v*100 for v in vals]
             return f"{vals[0]:.0f}x{vals[1]:.0f}"
 
-    # Varredura 3D
+    # 2. Varredura 3D (Fallback)
     if not pilar.Representation: return "N/A"
     
     pontos_x, pontos_y = [], []
+    
+    def coletar_pontos(item):
+        # Proteção contra recursão infinita ou tipos inválidos
+        if item is None: return
+        
+        # Se for lista ou tupla, navega dentro
+        if isinstance(item, (list, tuple)):
+            for i in item: coletar_pontos(i)
+            return
+
+        # Verifica se é entidade IFC válida antes de chamar .is_a()
+        if not hasattr(item, 'is_a'): return
+
+        # Se for Ponto Cartesiano
+        if item.is_a('IfcCartesianPoint'):
+            if hasattr(item, 'Coordinates') and len(item.Coordinates) >= 2:
+                pontos_x.append(item.Coordinates[0])
+                pontos_y.append(item.Coordinates[1])
+            return
+
+        # Lista de atributos para explorar recursivamente
+        atributos_para_explorar = [
+            'Points', 'OuterCurve', 'PolygonalBoundary', 
+            'FbsmFaces', 'CfsFaces', 'Bounds', 'Bound', 
+            'Items', 'MappingSource', 'MappedRepresentation', 
+            'Polygon', 'SweptArea'
+        ]
+        
+        for attr in atributos_para_explorar:
+            if hasattr(item, attr):
+                val = getattr(item, attr)
+                coletar_pontos(val)
+
+    # Inicia a varredura
+    for rep in pilar.Representation.Representations:
+        if rep.RepresentationIdentifier in ['Body', 'Mesh', 'Box', 'Facetation']:
+            for item in rep.Items:
+                coletar_pontos(item)
+    
+    # Calcula dimensão final
+    if pontos_x and pontos_y:
+        try:
+            largura = max(pontos_x) - min(pontos_x)
+            altura = max(pontos_y) - min(pontos_y)
+            
+            # Filtro de sanidade (evitar 0x0)
+            if largura <= 0 or altura <= 0: return "N/A"
+
+            if largura < 3.0: largura *= 100
+            if altura < 3.0: altura *= 100
+            
+            dims = sorted([largura, altura])
+            return f"{dims[0]:.0f}x{dims[1]:.0f}"
+        except:
+            return "N/A"
+
+    return "N/A"
     
     def coletar_pontos(item):
         if item.is_a('IfcCartesianPoint') and len(item.Coordinates) >= 2:
@@ -280,3 +337,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
