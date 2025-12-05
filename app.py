@@ -20,10 +20,10 @@ from collections import Counter
 ARQUIVO_CREDENCIAIS = "credenciais.json"
 NOME_PLANILHA_GOOGLE = "Sistema_Conferencia_BIM"
 
-# --- CACHE GLOBAL ---
+# --- CACHE GLOBAL PARA ARMADURAS ---
 CACHE_ARMADURAS_POR_NOME = {}
 
-# --- CONEXÃO ---
+# --- FUNÇÕES DE CONEXÃO ---
 def conectar_google_sheets():
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
@@ -40,77 +40,92 @@ def limpar_string(texto):
     if not texto: return "X"
     return "".join(e for e in str(texto) if e.isalnum()).upper()
 
-# --- LÓGICA TQS: INTERPRETAÇÃO DE ARMADURAS ---
-
+# --- LÓGICA DE EXTRAÇÃO DE ARMADURA (MÉTODO TQS) ---
 def indexar_todas_armaduras(ifc_file):
     """
-    Lê barra por barra (IfcReinforcingBar) conforme orientação da TQS.
-    Interpreta o Nome para achar o dono e soma as quantidades.
+    Lê todas as barras conforme orientação do suporte TQS.
+    Interpreta o atributo 'Name' de cada IfcReinforcingBar.
     """
     global CACHE_ARMADURAS_POR_NOME
     CACHE_ARMADURAS_POR_NOME = {}
     
-    # Busca todas as barras no arquivo (Orientação TQS: "ler barra por barra")
+    # Busca todas as barras (Barra por barra, como instruído)
     barras = ifc_file.by_type('IfcReinforcingBar')
     
     for bar in barras:
-        nome_completo = bar.Name 
+        nome_completo = bar.Name # Ex: "1 P1 \X\D810.00 C=280.00"
         if not nome_completo: continue
         
-        # 1. Identificar o PILAR (Dono)
-        # O TQS escreve o nome da posição no texto (ex: "P1", "P12")
-        # Regex: Procura (P + Numeros) com espaços ao redor ou inicio de linha
-        match_nome = re.search(r'\b(P\d+)\b', nome_completo)
+        # 1. Identificar o DONO (Pilar)
+        # O suporte confirmou que a Posição (P1) está no texto.
+        # Regex: Procura "P" seguido de números (ex: P1, P12)
+        match_nome = re.search(r'(P\d+)', nome_completo)
         
         if match_nome:
             nome_pilar = match_nome.group(1) # Ex: "P1"
-            
-            # 2. Identificar a QUANTIDADE
-            # O TQS indicou que a quantidade não é atributo, tem que interpretar.
-            # Geralmente o nome começa com a quantidade: "1 P1..." ou "5 P1..."
-            # Se não tiver numero no começo, assumimos 1 (barra unitária).
-            qtd = 1
-            match_qtd = re.search(r'^(\d+)\s+', nome_completo)
-            if match_qtd:
-                qtd = int(match_qtd.group(1))
-            
-            # 3. Identificar a BITOLA (Diâmetro)
-            # A TQS segue o padrão IFC, então a bitola deve estar em NominalDiameter
             bitola = 0.0
-            if hasattr(bar, "NominalDiameter") and bar.NominalDiameter:
-                # IFC armazena em Metros (0.01), convertemos para mm (10.0)
-                bitola = bar.NominalDiameter * 1000
-            else:
-                # Fallback: Tenta ler do texto se o atributo falhar (\X\D8 ou Ø)
-                match_bitola_txt = re.search(r'([0-9]+\.[0-9]+)', nome_completo.split(nome_pilar)[-1])
-                if match_bitola_txt:
-                    bitola = float(match_bitola_txt.group(1))
             
-            # ARMAZENAMENTO NO CACHE
+            # 2. Identificar a BITOLA (Diâmetro)
+            # O suporte mostrou "\X\D8" como símbolo de diâmetro.
+            # Também tentamos achar valores numéricos após o nome do pilar.
+            
+            # Tentativa 1: Padrão exato TQS (\X\D8)
+            match_tqs = re.search(r'\\X\\D8\s*([0-9\.]+)', nome_completo)
+            
+            # Tentativa 2: Padrão genérico (Pega o primeiro float após o nome P1)
+            # Útil se o Python já tiver limpado o caractere especial
+            match_generico = False
+            try:
+                resto = nome_completo.split(nome_pilar, 1)[1]
+                match_generico = re.search(r'([0-9]+\.[0-9]+)', resto)
+            except:
+                pass
+
+            if match_tqs:
+                bitola = float(match_tqs.group(1))
+            elif match_generico:
+                bitola = float(match_generico.group(1))
+            elif hasattr(bar, "NominalDiameter") and bar.NominalDiameter:
+                # Fallback: Propriedade física do IFC (em metros)
+                bitola = bar.NominalDiameter * 1000 
+            
+            # 3. Identificar a QUANTIDADE
+            # O texto começa geralmente com "1 P1...". Esse "1" é a quantidade desta barra específica.
+            # Se for barra por barra, somamos 1. Se for agrupado, somamos esse número.
+            qtd_barra = 1
+            match_qtd = re.search(r'^(\d+)\s+P', nome_completo)
+            if match_qtd:
+                qtd_barra = int(match_qtd.group(1))
+
             if bitola > 0:
                 if nome_pilar not in CACHE_ARMADURAS_POR_NOME:
                     CACHE_ARMADURAS_POR_NOME[nome_pilar] = []
                 
-                # Adiciona a bitola repetidas vezes conforme a quantidade encontrada
-                # Ex: Se qtd=5 e bitola=10, adiciona 10, 10, 10, 10, 10 na lista
-                for _ in range(qtd):
+                # Adiciona N vezes a bitola na lista (para contar depois)
+                for _ in range(qtd_barra):
                     CACHE_ARMADURAS_POR_NOME[nome_pilar].append(bitola)
 
 def obter_armadura_do_cache(nome_pilar):
-    """Consolida os dados lidos barra por barra."""
+    """Resume a contagem das barras."""
     if nome_pilar not in CACHE_ARMADURAS_POR_NOME:
+        # Tenta procurar com variações (Ex: se o pilar chama "Pilar P1")
+        match = re.search(r'(P\d+)', nome_pilar)
+        if match:
+            nome_curto = match.group(1)
+            if nome_curto in CACHE_ARMADURAS_POR_NOME:
+                return formatar_resumo(CACHE_ARMADURAS_POR_NOME[nome_curto])
         return "Verificar Detalhamento"
     
-    lista_bitolas = CACHE_ARMADURAS_POR_NOME[nome_pilar]
+    return formatar_resumo(CACHE_ARMADURAS_POR_NOME[nome_pilar])
+
+def formatar_resumo(lista_bitolas):
     c = Counter(lista_bitolas)
-    
-    # Formata para leitura humana: "4 ø10.0 + 12 ø5.0"
+    # Ordena do mais grosso para o mais fino
     return " + ".join([f"{qtd} ø{diam:.1f}" for diam, qtd in sorted(c.items(), key=lambda item: item[0], reverse=True)])
 
-# --- GEOMETRIA TQS (Bounding Box) ---
-
+# --- LÓGICA DE EXTRAÇÃO DE GEOMETRIA (MANTIDA ROBUSTA) ---
 def extrair_secao_universal(pilar):
-    # 1. Psets TQS (Se existirem, são a fonte oficial)
+    # Tenta Psets TQS (Imagem 009 do email do suporte)
     psets = ifcopenshell.util.element.get_psets(pilar)
     if 'TQS_Geometria' in psets:
         d = psets['TQS_Geometria']
@@ -121,7 +136,7 @@ def extrair_secao_universal(pilar):
             if vals[0] < 3.0: vals = [v*100 for v in vals]
             return f"{vals[0]:.0f}x{vals[1]:.0f}"
 
-    # 2. Medição 3D (Se o Pset falhar)
+    # Fallback Geométrico (Bounding Box)
     if not pilar.Representation: return "N/A"
     pontos_x, pontos_y = [], []
     
@@ -137,7 +152,6 @@ def extrair_secao_universal(pilar):
             pontos_y.append(item.Coordinates[1])
             return
 
-        # Explora recursivamente a estrutura de geometria do TQS
         atributos = ['Points', 'OuterCurve', 'PolygonalBoundary', 'FbsmFaces', 'CfsFaces', 'Bounds', 'Bound', 'Items', 'MappingSource', 'MappedRepresentation', 'Polygon', 'SweptArea']
         for attr in atributos:
             if hasattr(item, attr):
@@ -161,23 +175,19 @@ def extrair_secao_universal(pilar):
             return "N/A"
     return "N/A"
 
-# --- PROCESSAMENTO PRINCIPAL ---
-
 def processar_ifc(caminho_arquivo, id_projeto_input):
     ifc_file = ifcopenshell.open(caminho_arquivo)
     
-    # 1. Indexação: Lê e interpreta todas as barras antes
+    # 1. INDEXAÇÃO GLOBAL (Lê tudo antes de começar)
     indexar_todas_armaduras(ifc_file)
     
     pilares = ifc_file.by_type('IfcColumn')
     dados = []
-    
     progresso = st.progress(0)
     total = len(pilares)
     
     for i, pilar in enumerate(pilares):
         progresso.progress((i + 1) / total)
-        
         guid = pilar.GlobalId
         nome = pilar.Name if pilar.Name else "S/N"
         
@@ -188,12 +198,9 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
         sufixo_pav = limpar_string(pavimento)
         sufixo_nome = limpar_string(nome)
         
-        # ID ROBUSTO
         id_unico_pilar = f"{sufixo_nome}-{guid}-{sufixo_pav}-{id_projeto_input}"
 
         secao = extrair_secao_universal(pilar)
-        
-        # Busca a armadura que foi interpretada no passo 1
         armadura = obter_armadura_do_cache(nome)
 
         dados.append({
@@ -211,7 +218,7 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
     dados.sort(key=lambda x: (x['Pavimento'], x['Nome']))
     return dados
 
-# --- PDF (MANTIDO O FORMATO CORRETO) ---
+# --- PDF (LAYOUT RÍGIDO 2 COLUNAS) ---
 def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -222,15 +229,18 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
     MARGEM_SUP = 10 * mm
     ESPACO_X = 5 * mm
     ESPACO_Y = 5 * mm
+    
     x = MARGEM_ESQ
     y = altura_pag - MARGEM_SUP - ALTURA_ETQ
     coluna_atual = 0
+    
     c.setTitle(f"Etiquetas - {nome_projeto_legivel}")
     
     for i, pilar in enumerate(dados_pilares):
         c.setLineWidth(1)
         c.setStrokeColor(colors.black)
         c.rect(x, y, LARGURA_ETQ, ALTURA_ETQ)
+        
         qr = qrcode.QRCode(box_size=10, border=0)
         qr.add_data(pilar['ID_Unico'])
         qr.make(fit=True)
@@ -264,11 +274,13 @@ def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
             y -= (ALTURA_ETQ + ESPACO_Y)
         else:
             x += (LARGURA_ETQ + ESPACO_X)
+            
         if y < MARGEM_SUP:
             c.showPage()
             y = altura_pag - MARGEM_SUP - ALTURA_ETQ
             x = MARGEM_ESQ
             coluna_atual = 0
+            
     c.save()
     buffer.seek(0)
     return buffer
@@ -285,20 +297,21 @@ def main():
             st.rerun()
         return
 
-    st.title("🏗️ Gestor BIM (Relacional)")
-    nome_projeto_legivel = st.text_input("Nome da Obra", placeholder="Ex: Edifício Diogenes")
-    id_projeto = limpar_string(nome_projeto_legivel)
-    arquivo_upload = st.file_uploader("Carregar IFC (TQS)", type=["ifc"])
+    st.title("🏗️ Gestor BIM (TQS Edition)")
     
-    if arquivo_upload and nome_projeto_legivel:
+    nome_projeto = st.text_input("Nome da Obra", placeholder="Ex: Edifício Diogenes")
+    id_proj = limpar_string(nome_projeto)
+    f = st.file_uploader("Carregar IFC (TQS)", type=["ifc"])
+    
+    if f and nome_projeto:
         if st.button("🚀 PROCESSAR DADOS"):
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as t:
-                    t.write(arquivo_upload.getvalue())
+                    t.write(f.getvalue())
                     path = t.name
                 
-                with st.spinner('Lendo IFC e Armaduras...'):
-                    dados = processar_ifc(path, id_projeto)
+                with st.spinner('Minerando dados (Lógica TQS)...'):
+                    dados = processar_ifc(path, id_proj)
                 os.remove(path)
                 
                 with st.spinner('Atualizando Banco de Dados...'):
@@ -309,8 +322,8 @@ def main():
                     except: ws_p = sh.add_worksheet("Projetos", 100, 5)
                     recs = ws_p.get_all_records()
                     df = pd.DataFrame(recs)
-                    if not df.empty and 'ID_Projeto' in df.columns: df = df[df['ID_Projeto'] != id_projeto]
-                    new = {'ID_Projeto': id_projeto, 'Nome_Obra': nome_projeto_legivel, 'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y"), 'Total_Pilares': len(dados)}
+                    if not df.empty and 'ID_Projeto' in df.columns: df = df[df['ID_Projeto'] != id_proj]
+                    new = {'ID_Projeto': id_proj, 'Nome_Obra': nome_projeto, 'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y"), 'Total_Pilares': len(dados)}
                     df = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
                     ws_p.clear()
                     ws_p.update([df.columns.values.tolist()] + df.values.tolist())
@@ -319,16 +332,16 @@ def main():
                     except: ws_pil = sh.add_worksheet("Pilares", 1000, 10)
                     recs = ws_pil.get_all_records()
                     df = pd.DataFrame(recs)
-                    if not df.empty and 'Projeto_Ref' in df.columns: df = df[df['Projeto_Ref'] != id_projeto]
+                    if not df.empty and 'Projeto_Ref' in df.columns: df = df[df['Projeto_Ref'] != id_proj]
                     df = pd.concat([df, pd.DataFrame(dados)], ignore_index=True)
                     ws_pil.clear()
                     ws_pil.update([df.columns.values.tolist()] + df.values.tolist())
                 
                 with st.spinner('Gerando PDF...'):
-                    pdf = gerar_pdf_memoria(dados, nome_projeto_legivel)
+                    pdf = gerar_pdf_memoria(dados, nome_projeto)
                 
-                st.success(f"✅ Processado! {len(dados)} pilares.")
-                st.download_button("📥 BAIXAR PDF", pdf, f"Etiquetas_{id_projeto}.pdf", "application/pdf")
+                st.success(f"✅ Sucesso! {len(dados)} pilares encontrados.")
+                st.download_button("📥 BAIXAR PDF", pdf, f"Etiquetas_{id_proj}.pdf", "application/pdf")
             except Exception as e:
                 st.error(f"Erro: {e}")
 
