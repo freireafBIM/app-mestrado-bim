@@ -40,58 +40,35 @@ def limpar_string(texto):
     if not texto: return "X"
     return "".join(e for e in str(texto) if e.isalnum()).upper()
 
-# --- LÓGICA DE EXTRAÇÃO DE ARMADURA (MÉTODO TQS) ---
+# --- LÓGICA DE EXTRAÇÃO DE ARMADURA (TQS) ---
 def indexar_todas_armaduras(ifc_file):
-    """
-    Lê todas as barras conforme orientação do suporte TQS.
-    Interpreta o atributo 'Name' de cada IfcReinforcingBar.
-    """
     global CACHE_ARMADURAS_POR_NOME
     CACHE_ARMADURAS_POR_NOME = {}
-    
-    # Busca todas as barras (Barra por barra, como instruído)
     barras = ifc_file.by_type('IfcReinforcingBar')
     
     for bar in barras:
-        nome_completo = bar.Name # Ex: "1 P1 \X\D810.00 C=280.00"
+        nome_completo = bar.Name 
         if not nome_completo: continue
         
-        # 1. Identificar o DONO (Pilar)
-        # O suporte confirmou que a Posição (P1) está no texto.
-        # Regex: Procura "P" seguido de números (ex: P1, P12)
-        match_nome = re.search(r'(P\d+)', nome_completo)
+        # Regex TQS: Procura "P" seguido de números
+        match_nome = re.search(r'^\d+\s+(P\d+)\s', nome_completo)
         
         if match_nome:
-            nome_pilar = match_nome.group(1) # Ex: "P1"
+            nome_pilar = match_nome.group(1)
             bitola = 0.0
             
-            # 2. Identificar a BITOLA (Diâmetro)
-            # O suporte mostrou "\X\D8" como símbolo de diâmetro.
-            # Também tentamos achar valores numéricos após o nome do pilar.
-            
-            # Tentativa 1: Padrão exato TQS (\X\D8)
-            match_tqs = re.search(r'\\X\\D8\s*([0-9\.]+)', nome_completo)
-            
-            # Tentativa 2: Padrão genérico (Pega o primeiro float após o nome P1)
-            # Útil se o Python já tiver limpado o caractere especial
-            match_generico = False
             try:
-                resto = nome_completo.split(nome_pilar, 1)[1]
-                match_generico = re.search(r'([0-9]+\.[0-9]+)', resto)
+                resto_string = nome_completo.split(nome_pilar, 1)[1]
+                match_bitola = re.search(r'([0-9]+\.[0-9]+)', resto_string)
+                if match_bitola:
+                    bitola = float(match_bitola.group(1))
             except:
                 pass
-
-            if match_tqs:
-                bitola = float(match_tqs.group(1))
-            elif match_generico:
-                bitola = float(match_generico.group(1))
-            elif hasattr(bar, "NominalDiameter") and bar.NominalDiameter:
-                # Fallback: Propriedade física do IFC (em metros)
+            
+            if bitola == 0.0 and hasattr(bar, "NominalDiameter") and bar.NominalDiameter:
                 bitola = bar.NominalDiameter * 1000 
             
-            # 3. Identificar a QUANTIDADE
-            # O texto começa geralmente com "1 P1...". Esse "1" é a quantidade desta barra específica.
-            # Se for barra por barra, somamos 1. Se for agrupado, somamos esse número.
+            # Identificar Quantidade (geralmente é o número no início da string "1 P1...")
             qtd_barra = 1
             match_qtd = re.search(r'^(\d+)\s+P', nome_completo)
             if match_qtd:
@@ -100,32 +77,19 @@ def indexar_todas_armaduras(ifc_file):
             if bitola > 0:
                 if nome_pilar not in CACHE_ARMADURAS_POR_NOME:
                     CACHE_ARMADURAS_POR_NOME[nome_pilar] = []
-                
-                # Adiciona N vezes a bitola na lista (para contar depois)
+                # Adiciona N vezes para a contagem correta
                 for _ in range(qtd_barra):
                     CACHE_ARMADURAS_POR_NOME[nome_pilar].append(bitola)
 
 def obter_armadura_do_cache(nome_pilar):
-    """Resume a contagem das barras."""
     if nome_pilar not in CACHE_ARMADURAS_POR_NOME:
-        # Tenta procurar com variações (Ex: se o pilar chama "Pilar P1")
-        match = re.search(r'(P\d+)', nome_pilar)
-        if match:
-            nome_curto = match.group(1)
-            if nome_curto in CACHE_ARMADURAS_POR_NOME:
-                return formatar_resumo(CACHE_ARMADURAS_POR_NOME[nome_curto])
         return "Verificar Detalhamento"
-    
-    return formatar_resumo(CACHE_ARMADURAS_POR_NOME[nome_pilar])
-
-def formatar_resumo(lista_bitolas):
+    lista_bitolas = CACHE_ARMADURAS_POR_NOME[nome_pilar]
     c = Counter(lista_bitolas)
-    # Ordena do mais grosso para o mais fino
     return " + ".join([f"{qtd} ø{diam:.1f}" for diam, qtd in sorted(c.items(), key=lambda item: item[0], reverse=True)])
 
-# --- LÓGICA DE EXTRAÇÃO DE GEOMETRIA (MANTIDA ROBUSTA) ---
+# --- LÓGICA DE EXTRAÇÃO DE GEOMETRIA (UNIVERSAL) ---
 def extrair_secao_universal(pilar):
-    # Tenta Psets TQS (Imagem 009 do email do suporte)
     psets = ifcopenshell.util.element.get_psets(pilar)
     if 'TQS_Geometria' in psets:
         d = psets['TQS_Geometria']
@@ -136,7 +100,6 @@ def extrair_secao_universal(pilar):
             if vals[0] < 3.0: vals = [v*100 for v in vals]
             return f"{vals[0]:.0f}x{vals[1]:.0f}"
 
-    # Fallback Geométrico (Bounding Box)
     if not pilar.Representation: return "N/A"
     pontos_x, pontos_y = [], []
     
@@ -175,14 +138,16 @@ def extrair_secao_universal(pilar):
             return "N/A"
     return "N/A"
 
+# --- ORDENAÇÃO NATURAL ---
+def natural_keys(text):
+    return [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', text)]
+
 def processar_ifc(caminho_arquivo, id_projeto_input):
     ifc_file = ifcopenshell.open(caminho_arquivo)
-    
-    # 1. INDEXAÇÃO GLOBAL (Lê tudo antes de começar)
     indexar_todas_armaduras(ifc_file)
-    
     pilares = ifc_file.by_type('IfcColumn')
     dados = []
+    
     progresso = st.progress(0)
     total = len(pilares)
     
@@ -215,10 +180,11 @@ def processar_ifc(caminho_arquivo, id_projeto_input):
             'Responsavel': ''
         })
     
-    dados.sort(key=lambda x: (x['Pavimento'], x['Nome']))
+    # Ordenação Natural (P1, P2... P10)
+    dados.sort(key=lambda x: (x['Pavimento'], natural_keys(x['Nome'])))
     return dados
 
-# --- PDF (LAYOUT RÍGIDO 2 COLUNAS) ---
+# --- PDF (LAYOUT RÍGIDO) ---
 def gerar_pdf_memoria(dados_pilares, nome_projeto_legivel):
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
@@ -298,19 +264,18 @@ def main():
         return
 
     st.title("🏗️ Gestor BIM (TQS Edition)")
-    
-    nome_projeto = st.text_input("Nome da Obra", placeholder="Ex: Edifício Diogenes")
-    id_proj = limpar_string(nome_projeto)
+    nome = st.text_input("Nome da Obra", placeholder="Ex: Edifício Diogenes")
+    id_proj = limpar_string(nome)
     f = st.file_uploader("Carregar IFC (TQS)", type=["ifc"])
     
-    if f and nome_projeto:
+    if f and nome:
         if st.button("🚀 PROCESSAR DADOS"):
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as t:
                     t.write(f.getvalue())
                     path = t.name
                 
-                with st.spinner('Minerando dados (Lógica TQS)...'):
+                with st.spinner('Minerando dados do IFC...'):
                     dados = processar_ifc(path, id_proj)
                 os.remove(path)
                 
@@ -318,29 +283,41 @@ def main():
                     client = conectar_google_sheets()
                     sh = client.open(NOME_PLANILHA_GOOGLE)
                     
+                    # 1. ATUALIZA PROJETOS
                     try: ws_p = sh.worksheet("Projetos")
                     except: ws_p = sh.add_worksheet("Projetos", 100, 5)
                     recs = ws_p.get_all_records()
                     df = pd.DataFrame(recs)
                     if not df.empty and 'ID_Projeto' in df.columns: df = df[df['ID_Projeto'] != id_proj]
-                    new = {'ID_Projeto': id_proj, 'Nome_Obra': nome_projeto, 'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y"), 'Total_Pilares': len(dados)}
-                    df = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
+                    new = {'ID_Projeto': id_proj, 'Nome_Obra': nome, 'Data_Upload': datetime.datetime.now().strftime("%d/%m/%Y"), 'Total_Pilares': len(dados)}
+                    # Correção: fillna e astype(str) para evitar erros de JSON
+                    df_final = pd.concat([df, pd.DataFrame([new])], ignore_index=True).fillna("").astype(str)
                     ws_p.clear()
-                    ws_p.update([df.columns.values.tolist()] + df.values.tolist())
+                    ws_p.update([df_final.columns.values.tolist()] + df_final.values.tolist())
 
+                    # 2. ATUALIZA PILARES (AQUI ESTAVA O PROBLEMA)
                     try: ws_pil = sh.worksheet("Pilares")
                     except: ws_pil = sh.add_worksheet("Pilares", 1000, 10)
                     recs = ws_pil.get_all_records()
                     df = pd.DataFrame(recs)
                     if not df.empty and 'Projeto_Ref' in df.columns: df = df[df['Projeto_Ref'] != id_proj]
-                    df = pd.concat([df, pd.DataFrame(dados)], ignore_index=True)
+                    
+                    # Concatena
+                    df_pil_final = pd.concat([df, pd.DataFrame(dados)], ignore_index=True)
+                    
+                    # --- CORREÇÃO CRÍTICA DE LIMPEZA DE DADOS ---
+                    # Preenche valores vazios com string vazia e força tudo para string
+                    df_pil_final = df_pil_final.fillna("")
+                    df_pil_final = df_pil_final.astype(str)
+                    # ---------------------------------------------
+                    
                     ws_pil.clear()
-                    ws_pil.update([df.columns.values.tolist()] + df.values.tolist())
+                    ws_pil.update([df_pil_final.columns.values.tolist()] + df_pil_final.values.tolist())
                 
                 with st.spinner('Gerando PDF...'):
-                    pdf = gerar_pdf_memoria(dados, nome_projeto)
+                    pdf = gerar_pdf_memoria(dados, nome)
                 
-                st.success(f"✅ Sucesso! {len(dados)} pilares encontrados.")
+                st.success(f"✅ Sucesso! {len(dados)} pilares encontrados e gravados.")
                 st.download_button("📥 BAIXAR PDF", pdf, f"Etiquetas_{id_proj}.pdf", "application/pdf")
             except Exception as e:
                 st.error(f"Erro: {e}")
