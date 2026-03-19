@@ -759,10 +759,12 @@ def _tela_principal() -> None:
     tipos_count = Counter(r["Tipo_Legivel"] for r in registros)
     vol_total   = round(sum(r.get("Volume_m3", 0) for r in registros), 2)
 
-    cols = st.columns(min(len(tipos_count) + 1, 5))
-    for i, (t, n) in enumerate(tipos_count.items()):
-        cols[i].metric(t, n)
-    cols[-1].metric("Volume total (m³)", vol_total)
+    # Monta lista de métricas: todos os tipos + volume total
+    metricas = list(tipos_count.items()) + [("Volume total (m³)", vol_total)]
+    N_COLS = 4  # número fixo de colunas — nunca estoura o índice
+    cols = st.columns(N_COLS)
+    for i, (label, valor) in enumerate(metricas):
+        cols[i % N_COLS].metric(label, valor)
 
     # Filtros
     filtrados = [
