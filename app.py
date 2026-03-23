@@ -856,32 +856,53 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                             return v
                 return fallback
 
-            material  = get("TQS_Padrao.Material")
+            # Material: v27 → TQS_Padrao.Material; v22 não tem esse campo
+            # Fallback: ler do IfcMaterial associado ao elemento.
+            material = get("TQS_Padrao.Material")
+            if material == "—":
+                try:
+                    for assoc in (elem.HasAssociations or []):
+                        if assoc.is_a("IfcRelAssociatesMaterial"):
+                            mat = assoc.RelatingMaterial
+                            if mat and mat.is_a("IfcMaterial"):
+                                material = decode_ifc(mat.Name or "")
+                            elif mat and mat.is_a("IfcMaterialList"):
+                                nomes = [decode_ifc(m.Name or "") for m in (mat.Materials or [])]
+                                material = ", ".join(n for n in nomes if n)
+                            break
+                except Exception:
+                    pass
+
+            # Cobrimento: v27 → TQS_Armaduras.Cobrimento; v22 nao tem Pset_TQS_Armaduras
             cobrimento = get("TQS_Armaduras.Cobrimento")
             protensao  = get("TQS_Armaduras.Tem_Protensao")
 
-            # Geometria específica por tipo (Pset tem precedência sobre bbox)
+            # Geometria especifica por tipo (Pset tem precedencia sobre bbox)
             if tipo_ifc == "IfcColumn":
                 secao = get("TQS_Geometria.Secao")
                 dim_b = get("TQS_Geometria.Dimensao_b1")
                 dim_h = get("TQS_Geometria.Dimensao_h1")
                 area_secao = get("TQS_Geometria.Area")
-                descricao_geo = (f"Seção:{secao} {dim_b}×{dim_h} cm"
-                                 if dim_b != "—" else f"Seção:{secao}")
+                descricao_geo = (f"Secao:{secao} {dim_b}x{dim_h} cm"
+                                 if dim_b != "—" else f"Secao:{secao}")
 
             elif tipo_ifc == "IfcBeam":
                 largura = get("TQS_Geometria.Largura")
                 altura  = get("TQS_Geometria.Altura")
                 vao     = get("TQS_Geometria.Vao_Titulo", "TQS_Geometria.Vao")
                 carga   = get("TQS_Geometria.Carga_linear")
-                descricao_geo = f"{largura}×{altura} cm | Vão:{vao}"
+                descricao_geo = f"{largura}x{altura} cm | Vao:{vao}"
 
             elif tipo_ifc == "IfcSlab":
-                esp     = get("TQS_Geometria.Altura")
-                area_sup = get("TQS_Geometria.Area_superficie")
-                carga_d = get("TQS_Geometria.Carga_distribuida")
                 tipo_laje = get("TQS_Geometria.Tipo")
-                descricao_geo = f"Esp:{esp} cm | Área:{area_sup} m² | {tipo_laje}"
+                area_sup  = get("TQS_Geometria.Area_superficie")
+                carga_d   = get("TQS_Geometria.Carga_distribuida")
+                # Espessura: v27=Altura; v22=Capa (laje nervurada/trelicada)
+                esp = get("TQS_Geometria.Altura", "TQS_Geometria.Capa")
+                # Area: v22 pode nao ter Area_superficie — usar bbox
+                if area_sup == "—" and geo["comp_cm"] > 0 and geo["larg_cm"] > 0:
+                    area_sup = f"{geo['comp_cm']*geo['larg_cm']/10000:.2f}"
+                descricao_geo = f"Esp:{esp} cm | Area:{area_sup} m2 | {tipo_laje}"
 
             elif tipo_ifc == "IfcFooting":
                 dim_x   = get("TQS_Geometria.Dimensoes_X")
@@ -889,16 +910,49 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 alt_f   = get("TQS_Geometria.Altura")
                 n_est   = get("TQS_Geometria.Estacas")
                 tipo_f  = get("TQS_Geometria.Tipo")
-                descricao_geo = f"{tipo_f} {dim_x}×{dim_y}×{alt_f} cm | Estacas:{n_est}"
+                descricao_geo = f"{tipo_f} {dim_x}x{dim_y}x{alt_f} cm | Estacas:{n_est}"
 
             elif tipo_ifc == "IfcPile":
                 diam_est = get("TQS_Geometria.Diametro", "TQS_Geometria.Dimensao_b1")
                 alt_est  = get("TQS_Geometria.Altura")
-                descricao_geo = f"Ø{diam_est} cm | H:{alt_est} cm"
+                descricao_geo = f"O{diam_est} cm | H:{alt_est} cm"
 
             else:  # Escada, outros
-                descricao_geo = (f"{geo['comp_cm']:.0f}×{geo['larg_cm']:.0f}×"
+                descricao_geo = (f"{geo['comp_cm']:.0f}x{geo['larg_cm']:.0f}x"
                                  f"{geo['alt_cm']:.0f} cm")
+
+            # Volume: _bbox retorna zero para FacetedBrep (v22) — recalcular
+            # a partir dos Psets quando disponivel.
+            if volume == 0.0:
+                try:
+                    if tipo_ifc == "IfcColumn":
+                        b_cm  = float(get("TQS_Geometria.Dimensao_b1") or 0)
+                        h_cm  = float(get("TQS_Geometria.Dimensao_h1") or 0)
+                        a_cm  = geo["alt_cm"] or float(get("TQS_Geometria.Altura") or 0)
+                        if b_cm and h_cm and a_cm:
+                            volume = round(b_cm * h_cm * a_cm / 1e6, 4)
+                    elif tipo_ifc == "IfcBeam":
+                        larg = float(get("TQS_Geometria.Largura") or 0)
+                        alt  = float(get("TQS_Geometria.Altura") or 0)
+                        comp = geo["comp_cm"]
+                        if larg and alt and comp:
+                            volume = round(larg * alt * comp / 1e6, 4)
+                    elif tipo_ifc == "IfcSlab":
+                        esp_cm = float(get("TQS_Geometria.Altura",
+                                          "TQS_Geometria.Capa") or 0)
+                        ar = float(get("TQS_Geometria.Area_superficie") or 0)
+                        if not ar and geo["comp_cm"] and geo["larg_cm"]:
+                            ar = geo["comp_cm"] * geo["larg_cm"] / 1e4
+                        if esp_cm and ar:
+                            volume = round(esp_cm / 100 * ar, 4)
+                    elif tipo_ifc == "IfcFooting":
+                        dx = float(get("TQS_Geometria.Dimensoes_X") or 0)
+                        dy = float(get("TQS_Geometria.Dimensoes_Y") or 0)
+                        dz = float(get("TQS_Geometria.Altura") or 0)
+                        if dx and dy and dz:
+                            volume = round(dx * dy * dz / 1e6, 4)
+                except Exception:
+                    pass
 
             armadura = formatar_armadura(cache_arm, elem.id())
 
