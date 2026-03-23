@@ -462,7 +462,8 @@ def indexar_armaduras(ifc_file) -> dict:
 
     # ── Passo 8: vincular barras ──────────────────────────────────────────────
     cache: dict[int, list] = defaultdict(list)
-    REGEX_DIAM = re.compile(r"[Ø\u00d8](\d+\.?\d*)", re.UNICODE)
+    REGEX_BARRA = re.compile(r"[Ø\u00d8](\d+\.?\d*)\s+C=(\d+\.?\d*)", re.UNICODE)
+    REGEX_DIAM  = re.compile(r"[Ø\u00d8](\d+\.?\d*)", re.UNICODE)
 
     sem_diam = sem_xy = sem_match = sem_num = 0
     vinculadas_spatial = vinculadas_numero = 0
@@ -475,11 +476,36 @@ def indexar_armaduras(ifc_file) -> dict:
                 continue
 
             nome = decode_ifc(barra.Name or "")
-            m = REGEX_DIAM.search(nome)
+            m = REGEX_BARRA.search(nome)
             if not m:
-                sem_diam += 1
-                continue
-            bitola = float(m.group(1))
+                # fallback: tentar apenas bitola sem comprimento
+                m_d = REGEX_DIAM.search(nome)
+                if not m_d:
+                    sem_diam += 1
+                    continue
+                bitola = float(m_d.group(1))
+                comp_cm = 0.0
+            else:
+                bitola  = float(m.group(1))
+                comp_cm = float(m.group(2))
+
+            # Sub-tipo da barra (longitudinal, transversal, etc.)
+            _OBJ_SUB: dict[str, str] = {
+                "Armadura longitudinal pilares":           "long",
+                "Armadura transversal pilares":            "trans",
+                "Armadura longitudinal compl pilares":     "long",
+                "Armadura longitudinal vigas":             "long",
+                "Armadura longitudinal vigas negativa":    "long",
+                "Armadura transversal vigas":              "trans",
+                "Armadura lateral vigas":                  "lat",
+                "Grampos de vigas":                        "grampo",
+                "Armadura longitudinal positiva lajes":    "long",
+                "Armadura longitudinal negativa lajes":    "long",
+                "Armadura longitudinal lajes secund\u00e1ria": "long",
+                "Armadura de funda\u00e7\u00f5es":        "long",
+                "Armadura de estacas":                     "long",
+            }
+            sub_tipo = _OBJ_SUB.get(obj_type_raw, "long")
 
             pav = storey_por_elem.get(barra.id(), "Sem pavimento")
 
@@ -503,7 +529,7 @@ def indexar_armaduras(ifc_file) -> dict:
                             best_dist = d
                             best = e_id
                 if best is not None:
-                    cache[best].append(bitola)
+                    cache[best].append((bitola, comp_cm, sub_tipo))
                     vinculadas_spatial += 1
                 else:
                     sem_match += 1
@@ -519,7 +545,7 @@ def indexar_armaduras(ifc_file) -> dict:
                 # Se múltiplos candidatos (ex: V2 com vários vãos), atribuir a todos
                 for e_id in candidatos:
                     if storey_por_elem.get(e_id, "?") == pav:
-                        cache[e_id].append(bitola)
+                        cache[e_id].append((bitola, comp_cm, sub_tipo))
                         vinculadas_numero += 1
                 if not candidatos:
                     sem_num += 1
@@ -537,16 +563,120 @@ def indexar_armaduras(ifc_file) -> dict:
     return dict(cache)
 
 
+# ── Tabela grau de aço (NBR 7480 / prática mercado brasileiro) ──────────────
+# Ø ≤ 6.0 mm → CA-60 (fios trefilados de alta resistência)
+# Ø > 6.0 mm → CA-50 (barras nervuradas)
+def grau_aco(diam_mm: float) -> str:
+    return "CA-60" if diam_mm <= 6.0 else "CA-50"
+
+
+# ── Peso linear (kg/m) — fórmula NBR: ρ = d² × 0.00617  (d em mm) ──────────
+def peso_linear_kg_m(diam_mm: float) -> float:
+    return diam_mm ** 2 * 0.00617
+
+
 def formatar_armadura(cache: dict, elem_eid: int) -> str:
     """
-    Consulta o cache pelo ID do elemento (inteiro) e retorna a armadura formatada.
-    Exemplo: "12 ø16.0 + 8 ø10.0 + 20 ø6.3"  — bitolas maiores primeiro.
+    Retorna a armadura longitudinal formatada (string resumida).
+    Exemplo: "12 ø16.0 + 8 ø10.0"  — bitolas maiores primeiro.
+    Exibe apenas barras longitudinais (sub_tipo == "long") para
+    compatibilidade com a coluna "Armadura" do Sheets.
     """
     if elem_eid not in cache:
         return "Sem armadura exportada"
-    contagem = Counter(cache[elem_eid])
+    barras = cache[elem_eid]
+    # Suporta tanto (bitola, comp, sub) quanto bitola simples (retrocompat.)
+    long_barras = [b[0] if isinstance(b, tuple) else b
+                   for b in barras
+                   if not isinstance(b, tuple) or b[2] == "long"]
+    if not long_barras:
+        # Fallback: mostrar qualquer barra se não houver longitudinal
+        long_barras = [b[0] if isinstance(b, tuple) else b for b in barras]
+    if not long_barras:
+        return "Sem armadura exportada"
+    contagem = Counter(long_barras)
     partes = sorted(contagem.items(), key=lambda x: -x[0])
     return " + ".join(f"{qtd} ø{diam:.1f}" for diam, qtd in partes)
+
+
+def detalhar_armadura(cache: dict, elem_eid: int) -> dict:
+    """
+    Retorna detalhamento completo da armadura de um elemento:
+    {
+      "longitudinal":   "12 ø16.0(CA-50) + 60 ø10.0(CA-50)",
+      "transversal":    "184 ø5.0(CA-60)",
+      "comp_total_m":   328.7,
+      "peso_total_kg":  266.8,
+      "por_bitola": [
+          {"bitola": 16.0, "grau": "CA-50", "qtd": 12,
+           "comp_unit_cm": 355.0, "comp_total_m": 42.6, "peso_kg": 67.3},
+          ...
+      ]
+    }
+    Conforme metodologia de Maciel (2018): comprimento unitário extraído do
+    atributo Name da IfcReinforcingBar (campo C=); grau de aço derivado da
+    bitola segundo NBR 7480 (CA-50 para Ø>6mm, CA-60 para Ø≤6mm).
+    """
+    if elem_eid not in cache:
+        return {}
+
+    barras = cache[elem_eid]
+    long_list  : list[tuple] = []
+    trans_list : list[tuple] = []
+
+    for b in barras:
+        if isinstance(b, tuple):
+            bitola, comp_cm, sub = b
+        else:
+            bitola, comp_cm, sub = b, 0.0, "long"
+
+        if sub == "long":
+            long_list.append((bitola, comp_cm))
+        else:
+            trans_list.append((bitola, comp_cm))
+
+    def _fmt_com_grau(lst: list[tuple]) -> str:
+        c = Counter(d for d, _ in lst)
+        return " + ".join(
+            f"{q} ø{d:.1f}({grau_aco(d)})"
+            for d, q in sorted(c.items(), key=lambda x: -x[0])
+        ) if c else "—"
+
+    def _por_bitola(lst: list[tuple]) -> list[dict]:
+        agrup: dict[float, list[float]] = defaultdict(list)
+        for d, c in lst:
+            agrup[d].append(c)
+        resultado = []
+        for d in sorted(agrup, reverse=True):
+            comps = agrup[d]
+            # Ignorar barras com C=0 no cálculo de peso/comprimento
+            comps_validos = [c for c in comps if c > 0]
+            comp_total_m = sum(comps_validos) / 100.0
+            peso_kg = peso_linear_kg_m(d) * comp_total_m
+            resultado.append({
+                "bitola":       d,
+                "grau":         grau_aco(d),
+                "qtd":          len(comps),
+                "comp_unit_cm": round(comps_validos[0], 2) if comps_validos else 0.0,
+                "comp_total_m": round(comp_total_m, 2),
+                "peso_kg":      round(peso_kg, 3),
+            })
+        return resultado
+
+    todas = long_list + trans_list
+    comp_total_m  = sum(c for _, c in todas if c > 0) / 100.0
+    peso_total_kg = sum(
+        peso_linear_kg_m(d) * (c / 100.0)
+        for d, c in todas if c > 0
+    )
+
+    return {
+        "longitudinal":  _fmt_com_grau(long_list),
+        "transversal":   _fmt_com_grau(trans_list),
+        "comp_total_m":  round(comp_total_m, 2),
+        "peso_total_kg": round(peso_total_kg, 3),
+        "por_bitola":    _por_bitola(todas),
+    }
 
 
 
