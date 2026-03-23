@@ -844,11 +844,16 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
             volume   = _volume_m3(geo, tipo_ifc)
 
             # ── Extrair campos específicos dos Psets TQS ──────────────────────
+            # Compatibilidade entre versões TQS:
+            #   v27+: Pset sem prefixo  → "TQS_Geometria.Dimensao_b1"
+            #   v22:  Pset com prefixo  → "Pset_TQS_Geometria.Dimensao_b1"
             def get(*chaves: str, fallback: str = "—") -> str:
                 for c in chaves:
-                    v = ps.get(c, "")
-                    if v and v not in ("$", "—"):
-                        return v
+                    # Tentar sem prefixo (v27) e com prefixo Pset_ (v22)
+                    for chave in (c, "Pset_" + c):
+                        v = ps.get(chave, "")
+                        if v and v not in ("$", "—"):
+                            return v
                 return fallback
 
             material  = get("TQS_Padrao.Material")
