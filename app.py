@@ -27,7 +27,7 @@ Estrutura de Psets TQS confirmada neste modelo:
 """
 
 import streamlit as st
-import os, re, io, tempfile, datetime
+import os, re, io, tempfile, datetime, math
 from collections import defaultdict, Counter
 
 import ifcopenshell
@@ -289,65 +289,85 @@ def indexar_armaduras(ifc_file) -> dict:
     # ── Extração do ponto inicial da barra (Directrix do SweptDiskSolid) ──────
     def get_bar_start_xy(barra) -> tuple | None:
         """
-        Percorre a árvore de representação da barra para encontrar o primeiro
-        IfcCartesianPoint 3D dentro da curva Directrix (IfcSweptDiskSolid
-        ou IfcCompositeCurve/IfcLine).
-        Retorna (x, y) em unidades do modelo (cm para TQS).
+        Extrai (x, y) do primeiro ponto da curva Directrix da barra.
+
+        Hierarquia real do IFC TQS confirmada por inspeção do arquivo:
+          IfcShapeRepresentation.Items
+            → IfcSweptDiskSolid.Directrix
+              → IfcCompositeCurve.Segments[0]
+                → IfcCompositeCurveSegment.ParentCurve   ← atributo correto
+                  → IfcLine.Pnt                          ← atributo correto
+                    → IfcCartesianPoint.Coordinates
+
+        Atributos críticos que estavam errados na versão anterior:
+          - IfcCompositeCurveSegment usa "ParentCurve" (não "Curve")
+          - IfcLine usa "Pnt" para o ponto inicial (não estava na lista)
         """
         if not getattr(barra, "Representation", None):
             return None
 
-        visited: set = set()
-
-        def find_point(obj, depth: int = 0):
-            if obj is None or depth > 12:
+        def ponto_de(obj, depth: int = 0) -> tuple | None:
+            """Navega recursivamente usando os atributos corretos do schema IFC."""
+            if obj is None or depth > 14:
                 return None
-            oid = id(obj)
-            if oid in visited:
-                return None
-            visited.add(oid)
-
             if not hasattr(obj, "is_a"):
                 return None
 
-            if obj.is_a("IfcCartesianPoint"):
-                coords = obj.Coordinates
-                if coords and len(coords) >= 3:
-                    return float(coords[0]), float(coords[1])
+            tipo = obj.is_a()
+
+            # Destino final: CartesianPoint
+            if tipo == "IfcCartesianPoint":
+                c = obj.Coordinates
+                if c and len(c) >= 2:
+                    return float(c[0]), float(c[1])
                 return None
 
-            # Tipos que podem conter o ponto
-            allowed = {
-                "IfcProductDefinitionShape", "IfcShapeRepresentation",
-                "IfcSweptDiskSolid", "IfcCompositeCurve",
-                "IfcCompositeCurveSegment", "IfcLine",
-                "IfcTrimmedCurve", "IfcCircle",
-            }
-            if obj.is_a() not in allowed:
-                return None
+            # IfcSweptDiskSolid → Directrix (a curva do eixo da barra)
+            if tipo == "IfcSweptDiskSolid":
+                return ponto_de(obj.Directrix, depth + 1)
 
-            for attr in ("Items", "Segments", "Curve", "BasisCurve",
-                         "Directrix", "Representations"):
-                val = getattr(obj, attr, None)
-                if val is None:
-                    continue
-                if isinstance(val, (list, tuple)):
-                    for v in val:
-                        pt = find_point(v, depth + 1)
-                        if pt is not None:
-                            return pt
-                else:
-                    pt = find_point(val, depth + 1)
+            # IfcCompositeCurve → percorrer Segments até achar um ponto
+            if tipo == "IfcCompositeCurve":
+                for seg in (obj.Segments or []):
+                    pt = ponto_de(seg, depth + 1)
                     if pt is not None:
                         return pt
+                return None
+
+            # IfcCompositeCurveSegment → ParentCurve (CORRETO — não "Curve")
+            if tipo == "IfcCompositeCurveSegment":
+                return ponto_de(obj.ParentCurve, depth + 1)
+
+            # IfcLine → Pnt (ponto inicial) (CORRETO — não estava na lista)
+            if tipo == "IfcLine":
+                return ponto_de(obj.Pnt, depth + 1)
+
+            # IfcTrimmedCurve → BasisCurve
+            if tipo == "IfcTrimmedCurve":
+                return ponto_de(obj.BasisCurve, depth + 1)
+
+            # IfcCircle → Position (centro do círculo)
+            if tipo == "IfcCircle":
+                return ponto_de(obj.Position, depth + 1)
+
+            # IfcAxis2Placement3D / 2D → Location
+            if tipo in ("IfcAxis2Placement3D", "IfcAxis2Placement2D"):
+                return ponto_de(obj.Location, depth + 1)
+
+            # IfcPolyline → primeiro ponto da lista
+            if tipo == "IfcPolyline":
+                pts = obj.Points or []
+                if pts:
+                    return ponto_de(pts[0], depth + 1)
+                return None
+
             return None
 
         for rep in barra.Representation.Representations:
-            if rep.RepresentationIdentifier in ("Body", "Axis"):
-                for item in rep.Items:
-                    pt = find_point(item)
-                    if pt is not None:
-                        return pt
+            for item in rep.Items:
+                pt = ponto_de(item)
+                if pt is not None:
+                    return pt
         return None
 
     # ── Vincular barras a elementos ───────────────────────────────────────────
