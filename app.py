@@ -176,23 +176,34 @@ def verificar_senha() -> str:
 
 def indexar_armaduras(ifc_file) -> dict:
     """
-    Varre todas as IfcReinforcingBar e agrupa bitolas por chave tripla
-    (nome_elemento, pavimento, tipo_ifc_pai).
+    Vincula cada IfcReinforcingBar ao seu elemento estrutural pai
+    por CONTENÇÃO ESPACIAL (bounding box em coordenadas absolutas).
 
-    CORREÇÃO CRÍTICA v2 — filtro por ObjectType:
-    O campo Name da IfcReinforcingBar no TQS contém um identificador de
-    nó geométrico interno ("P3", "V1"...) que NÃO é necessariamente o
-    nome do elemento pai. O mesmo prefixo "P3" aparece em barras de
-    pilares, vigas e lajes ao mesmo tempo.
+    MÉTODO:
+    O arquivo IFC TQS não contém relação explícita barra→elemento.
+    A vinculação correta usa geometria 3D:
 
-    O discriminador correto é o campo ObjectType da IfcReinforcingBar,
-    que o TQS preenche com valores como "Armadura longitudinal pilares"
-    ou "Armadura transversal vigas". A chave tripla garante que barras
-    de vigas que passam pelo nó P3 não contaminem a armadura do pilar P3.
+    1. Para cada elemento estrutural (pilar, viga, laje, fundação, estaca):
+       - Resolver o placement absoluto via ifcopenshell.util.placement
+       - Obter dimensões da seção cruzada do Pset TQS_Geometria
+       - Construir bounding box 2D: centro ± (metade_seção + tolerância)
+
+    2. Para cada IfcReinforcingBar:
+       - Extrair o primeiro CartesianPoint da Directrix (SweptDiskSolid)
+       - Esse ponto é a posição absoluta 3D do início da barra
+       - Filtrar pelo ObjectType para determinar o tipo esperado do pai
+
+    3. Containment: atribuir a barra ao elemento cujo bbox contém o
+       ponto (x,y) da barra — em caso de múltiplos matches, usar o
+       elemento mais próximo do centróide.
+
+    Retorna: { elemento_eid: [bitola, bitola, ...] }
     """
+    import numpy as np
+    import ifcopenshell.util.placement as ifc_placement
 
-    # ObjectType TQS → classe IFC do elemento pai
-    OBJECT_TYPE_TO_IFC: dict[str, str] = {
+    # ── Mapeamento ObjectType → tipo IFC do elemento pai ─────────────────────
+    OBJ_TO_IFC: dict[str, str] = {
         "Armadura longitudinal pilares":           "IfcColumn",
         "Armadura transversal pilares":            "IfcColumn",
         "Armadura longitudinal compl pilares":     "IfcColumn",
@@ -204,66 +215,214 @@ def indexar_armaduras(ifc_file) -> dict:
         "Armadura longitudinal positiva lajes":    "IfcSlab",
         "Armadura longitudinal negativa lajes":    "IfcSlab",
         "Armadura longitudinal lajes secund\u00e1ria": "IfcSlab",
-        "Armadura de funda\u00e7\u00f5es":        "IfcFooting",
+        "Armadura de funda\u00e7\u00f5es":          "IfcFooting",
         "Armadura de estacas":                     "IfcPile",
     }
 
-    # Mapa id_barra → pavimento
-    storey_por_elem: dict[str, str] = {}
+    TOLERANCIA_CM = 15.0  # margem além da meia-seção para capturar cantos de estribos
+
+    # ── Pavimento de cada elemento ────────────────────────────────────────────
+    storey_por_elem: dict[int, str] = {}
     for rel in ifc_file.by_type("IfcRelContainedInSpatialStructure"):
         try:
-            storey = rel.RelatingStructure.Name or "Sem pavimento"
+            storey = decode_ifc(rel.RelatingStructure.Name or "Sem pavimento")
             for elem in rel.RelatedElements:
-                storey_por_elem[elem.id()] = decode_ifc(storey)
+                storey_por_elem[elem.id()] = storey
         except Exception:
             pass
 
-    # cache[(nome_elem, pavimento, tipo_ifc_pai)] = [bitola, ...]
-    cache: dict[tuple, list] = defaultdict(list)
+    # ── Psets dos elementos ───────────────────────────────────────────────────
+    def get_dim(elem, *chaves: str) -> float:
+        """Lê primeira chave numérica encontrada nos Psets TQS_Geometria."""
+        try:
+            psets = ifcopenshell.util.element.get_psets(elem)
+            geo = psets.get("TQS_Geometria", {})
+            for k in chaves:
+                v = geo.get(k)
+                if v is not None:
+                    try:
+                        return float(str(v))
+                    except (ValueError, TypeError):
+                        pass
+        except Exception:
+            pass
+        return 0.0
+
+    # ── Construir bounding boxes absolutas dos elementos ─────────────────────
+    TIPOS_STRUCT = (
+        "IfcColumn", "IfcBeam", "IfcSlab",
+        "IfcFooting", "IfcPile", "IfcStair",
+    )
+    elem_bbox: dict[int, tuple] = {}  # id → (cx, cy, hb, hh, ifc_type)
+
+    for tipo in TIPOS_STRUCT:
+        for elem in ifc_file.by_type(tipo):
+            try:
+                M = ifc_placement.get_local_placement(elem.ObjectPlacement)
+                cx, cy = float(M[0, 3]), float(M[1, 3])
+            except Exception:
+                continue
+
+            # Dimensões da seção por tipo
+            tipo_ifc = elem.is_a()
+            if tipo_ifc == "IfcColumn":
+                b = get_dim(elem, "Dimensao_b1") or 35.0
+                h = get_dim(elem, "Dimensao_h1") or 14.0
+            elif tipo_ifc == "IfcBeam":
+                b = get_dim(elem, "Largura") or 14.0
+                h = get_dim(elem, "Altura")  or 35.0
+            elif tipo_ifc == "IfcSlab":
+                b, h = 600.0, 600.0   # laje: bbox generosa
+            elif tipo_ifc == "IfcFooting":
+                b = get_dim(elem, "Dimensoes_X") or get_dim(elem, "Diametro") or 60.0
+                h = get_dim(elem, "Dimensoes_Y") or b
+            elif tipo_ifc == "IfcPile":
+                d = get_dim(elem, "Diametro") or get_dim(elem, "Dimensao_b1") or 30.0
+                b, h = d, d
+            else:
+                b, h = 60.0, 60.0
+
+            hb = b / 2.0 + TOLERANCIA_CM
+            hh = h / 2.0 + TOLERANCIA_CM
+            elem_bbox[elem.id()] = (cx, cy, hb, hh, tipo_ifc)
+
+    # ── Extração do ponto inicial da barra (Directrix do SweptDiskSolid) ──────
+    def get_bar_start_xy(barra) -> tuple | None:
+        """
+        Percorre a árvore de representação da barra para encontrar o primeiro
+        IfcCartesianPoint 3D dentro da curva Directrix (IfcSweptDiskSolid
+        ou IfcCompositeCurve/IfcLine).
+        Retorna (x, y) em unidades do modelo (cm para TQS).
+        """
+        if not getattr(barra, "Representation", None):
+            return None
+
+        visited: set = set()
+
+        def find_point(obj, depth: int = 0):
+            if obj is None or depth > 12:
+                return None
+            oid = id(obj)
+            if oid in visited:
+                return None
+            visited.add(oid)
+
+            if not hasattr(obj, "is_a"):
+                return None
+
+            if obj.is_a("IfcCartesianPoint"):
+                coords = obj.Coordinates
+                if coords and len(coords) >= 3:
+                    return float(coords[0]), float(coords[1])
+                return None
+
+            # Tipos que podem conter o ponto
+            allowed = {
+                "IfcProductDefinitionShape", "IfcShapeRepresentation",
+                "IfcSweptDiskSolid", "IfcCompositeCurve",
+                "IfcCompositeCurveSegment", "IfcLine",
+                "IfcTrimmedCurve", "IfcCircle",
+            }
+            if obj.is_a() not in allowed:
+                return None
+
+            for attr in ("Items", "Segments", "Curve", "BasisCurve",
+                         "Directrix", "Representations"):
+                val = getattr(obj, attr, None)
+                if val is None:
+                    continue
+                if isinstance(val, (list, tuple)):
+                    for v in val:
+                        pt = find_point(v, depth + 1)
+                        if pt is not None:
+                            return pt
+                else:
+                    pt = find_point(val, depth + 1)
+                    if pt is not None:
+                        return pt
+            return None
+
+        for rep in barra.Representation.Representations:
+            if rep.RepresentationIdentifier in ("Body", "Axis"):
+                for item in rep.Items:
+                    pt = find_point(item)
+                    if pt is not None:
+                        return pt
+        return None
+
+    # ── Vincular barras a elementos ───────────────────────────────────────────
+    REGEX_DIAM = re.compile(r"[Ø\u00d8](\d+\.?\d*)", re.UNICODE)
+
+    cache: dict[int, list] = defaultdict(list)
+    sem_ponto = 0
+    sem_match = 0
 
     for barra in ifc_file.by_type("IfcReinforcingBar"):
         try:
-            nome_raw  = barra.Name or ""
-            nome      = decode_ifc(nome_raw)
-            nome_base = re.sub(r'\s*\(id\s*\d+\)', '', nome).strip()
-
-            match = REGEX_BARRA.match(nome_base)
-            if not match:
-                continue
-
-            nome_elem = match.group(1)
-            bitola    = float(match.group(2))
-
-            # Discriminador correto: ObjectType da barra
             obj_type_raw = decode_ifc(barra.ObjectType or "")
-            tipo_pai     = OBJECT_TYPE_TO_IFC.get(obj_type_raw)
-
-            # Descarta barras com ObjectType não mapeado
-            if tipo_pai is None:
+            tipo_esperado = OBJ_TO_IFC.get(obj_type_raw)
+            if tipo_esperado is None:
                 continue
+
+            nome = decode_ifc(barra.Name or "")
+            m = REGEX_DIAM.search(nome)
+            if not m:
+                continue
+            bitola = float(m.group(1))
 
             pav = storey_por_elem.get(barra.id(), "Sem pavimento")
-            cache[(nome_elem, pav, tipo_pai)].append(bitola)
+
+            # Posição absoluta do início da barra
+            xy = get_bar_start_xy(barra)
+            if xy is None:
+                sem_ponto += 1
+                continue
+            bx, by = xy
+
+            # Encontrar elemento que contém este ponto
+            melhor_eid: int | None = None
+            menor_dist = 1e9
+
+            for e_id, (cx, cy, hb, hh, tipo_e) in elem_bbox.items():
+                if tipo_e != tipo_esperado:
+                    continue
+                if storey_por_elem.get(e_id, "?") != pav:
+                    continue
+                if abs(bx - cx) <= hb and abs(by - cy) <= hh:
+                    dist = math.sqrt((bx - cx) ** 2 + (by - cy) ** 2)
+                    if dist < menor_dist:
+                        menor_dist = dist
+                        melhor_eid = e_id
+
+            if melhor_eid is not None:
+                cache[melhor_eid].append(bitola)
+            else:
+                sem_match += 1
 
         except Exception as e:
             st.warning(f"Barra ignorada (#{getattr(barra, 'id', '?')}): {e}")
 
+    if sem_ponto > 0:
+        st.info(f"ℹ️ {sem_ponto} barras sem geometria acessível (estrutura IFC não padrão).")
+    if sem_match > 0:
+        st.info(f"ℹ️ {sem_match} barras não alocadas a nenhum elemento (fora de todos os bounding boxes).")
+
     return dict(cache)
 
 
-def formatar_armadura(cache: dict, nome_elem: str, pavimento: str,
-                      tipo_ifc: str) -> str:
+def formatar_armadura(cache: dict, elem_eid: int) -> str:
     """
-    Consulta o cache pela chave tripla (nome, pavimento, tipo_ifc_pai).
-    Retorna armadura formatada: "12 ø16.0 + 8 ø10.0 + 20 ø6.3"
-    Bitolas maiores primeiro.
+    Consulta o cache pelo ID do elemento e retorna a armadura formatada.
+    Exemplo: "12 ø16.0 + 8 ø10.0 + 20 ø6.3"
+    Bitolas maiores aparecem primeiro.
     """
-    chave = (nome_elem, pavimento, tipo_ifc)
-    if chave not in cache:
-        return "Verificar detalhamento"
-    contagem = Counter(cache[chave])
+    if elem_eid not in cache:
+        return "Sem armadura exportada"
+    contagem = Counter(cache[elem_eid])
     partes = sorted(contagem.items(), key=lambda x: -x[0])
     return " + ".join(f"{qtd} ø{diam:.1f}" for diam, qtd in partes)
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -502,7 +661,7 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 descricao_geo = (f"{geo['comp_cm']:.0f}×{geo['larg_cm']:.0f}×"
                                  f"{geo['alt_cm']:.0f} cm")
 
-            armadura = formatar_armadura(cache_arm, nome, pavimento, tipo_ifc)
+            armadura = formatar_armadura(cache_arm, elem.id())
 
             registro = {
                 "ID_Unico":         _id_unico(elem, id_projeto, pavimento),
