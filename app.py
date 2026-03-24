@@ -1175,7 +1175,7 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
     except Exception:
         _iue_sap = None
 
-    for _elem in ifc_file.by_type("IfcFooting"):
+    for _elem in ifc.by_type("IfcFooting"):
         _pav = _pavimento(_elem)
         _nome = _elem.Name or "S/N"
         # Verificar se tem Pset_TQS_Geometria (presença de Dimensoes_X)
