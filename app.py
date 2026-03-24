@@ -654,7 +654,7 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         f"(Espacial: {vin_spatial} | Número: {vin_numero} | "
         f"Sem match: {sem_match} | Sem geometria: {sem_xy})"
     )
-    return dict(cache)
+    return dict(cache), viga_bbox3d
 
 # ── Tabela grau de aço (NBR 7480 / prática mercado brasileiro) ──────────────
 # Ø ≤ 6.0 mm → CA-60 (fios trefilados de alta resistência)
@@ -1004,7 +1004,7 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
 
     # ── 1. Indexar armaduras (uma única passagem sobre as 6943 barras) ────────
     with st.spinner("Indexando armaduras (IfcReinforcingBar)..."):
-        cache_arm = indexar_armaduras(ifc, caminho)
+        cache_arm, _viga_bbox3d_map = indexar_armaduras(ifc, caminho)
 
 
     # ── 2. Fusão de segmentos de nó de viga (≤ 20 cm) ────────────────────────
@@ -1021,12 +1021,15 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
             if _elem.ContainedInStructure else ""
         ) or "Sem pavimento"
         _nome = _elem.Name or "S/N"
-        # Comprimento via bounding box da geometria
-        try:
-            _geo = _bbox(_elem)
-            _comp = max(_geo["comp_cm"], _geo["larg_cm"])  # dimensão maior
-        except Exception:
-            _comp = 999.0
+        # Comprimento via viga_bbox3d já calculada em indexar_armaduras.
+        # xmin,xmax,ymin,ymax,zmin,zmax,eixo  → dimensão dominante = comprimento
+        _bb = _viga_bbox3d_map.get(_elem.id())
+        if _bb:
+            _dx = _bb[1] - _bb[0]
+            _dy = _bb[3] - _bb[2]
+            _comp = max(_dx, _dy)
+        else:
+            _comp = 999.0  # sem bbox → tratar como vão longo
         _key = (_nome, _pav)
         _segs_por_viga.setdefault(_key, []).append((_elem.id(), _comp))
 
