@@ -582,15 +582,24 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                 bx,by,bz = xyz
 
                 if tipo_step == "IFCBEAM":
-                    # Vigas: containment 3D via bbox do Brep/ExtrudedAreaSolid
-                    # Escolher o segmento com menor volume que contém a barra
-                    _TOL3 = 5.0
+                    # Vigas: containment 3D com tolerância ASSIMÉTRICA por eixo.
+                    # Barras longitudinais começam no nó do pilar (~15cm fora da bbox
+                    # no eixo da viga) → TOL_EIXO=15cm.
+                    # No eixo transversal, TOL=5cm evita falsos positivos em vigas paralelas.
+                    _TOL_EIXO = 15.0
+                    _TOL_TRANS = 5.0
+                    _TOL_Z = 5.0
                     best=None; best_vol=1e18; best_eixo="X"
                     for e_id,(xmin,xmax,ymin,ymax,zmin,zmax,eixo) in viga_bbox3d.items():
                         if storey_por_elem.get(e_id,"?")!=pav: continue
-                        if (xmin-_TOL3<=bx<=xmax+_TOL3 and
-                            ymin-_TOL3<=by<=ymax+_TOL3 and
-                            zmin-_TOL3<=bz<=zmax+_TOL3):
+                        if eixo=="X":
+                            ok_e = xmin-_TOL_EIXO  <= bx <= xmax+_TOL_EIXO
+                            ok_t = ymin-_TOL_TRANS <= by <= ymax+_TOL_TRANS
+                        else:
+                            ok_e = ymin-_TOL_EIXO  <= by <= ymax+_TOL_EIXO
+                            ok_t = xmin-_TOL_TRANS <= bx <= xmax+_TOL_TRANS
+                        ok_z = zmin-_TOL_Z <= bz <= zmax+_TOL_Z
+                        if ok_e and ok_t and ok_z:
                             vol=(xmax-xmin)*(ymax-ymin)*(zmax-zmin)
                             if vol<best_vol: best_vol=vol; best=e_id; best_eixo=eixo
                     if best:
