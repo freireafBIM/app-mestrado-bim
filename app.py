@@ -397,26 +397,96 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         return None
 
     # ── Passo 4: bounding boxes dos elementos ─────────────────────────────────
-    elem_bbox: dict[int,tuple] = {}  # eid → (cx, cy, hb, hh, tipo_STEP)
+    # Para PILARES, FUNDAÇÕES, ESTACAS: bbox 2D centrada (cx, cy, hb, hh)
+    # Para VIGAS: bbox 3D completa via vértices do Brep (v22) ou placement+dims (v27)
+    # Para LAJES: bbox 2D grande (cobre toda a planta)
+    elem_bbox: dict[int,tuple] = {}   # eid → (cx,cy,hb,hh,tipo_STEP)         [pilares/fund/estacas/lajes]
+    viga_bbox3d: dict[int,tuple] = {} # eid → (xmin,xmax,ymin,ymax,zmin,zmax,eixo)  [vigas]
+
+    _BREP_TYPES = {"IFCPRODUCTDEFINITIONSHAPE","IFCSHAPEREPRESENTATION",
+                   "IFCFACETEDBREP","IFCCLOSEDSHELL","IFCFACE",
+                   "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT"}
+
+    def _viga_bbox3d_brep(eid_str: str):
+        """Extrai bbox 3D de viga com FacetedBrep (v22) via vértices do Brep."""
+        if not _use_manual or eid_str not in _ents: return None
+        et,ed = _ents[eid_str]
+        parts = ed.split(","); repr_id = parts[6].strip().lstrip("#") if len(parts)>6 else ""
+        if repr_id not in _ents: return None
+        pts=[]; vis=set()
+        def _wk(pid, d=0):
+            if pid in vis or pid not in _ents or d>12: return
+            vis.add(pid); et2,ed2=_ents[pid]
+            if et2 not in _BREP_TYPES: return
+            if et2=="IFCCARTESIANPOINT":
+                c=_re.findall(r"[-\d.E+]+",ed2)
+                if len(c)>=3: pts.append((float(c[0]),float(c[1]),float(c[2])))
+                return
+            for r in _re.findall(r"#(\d+)",ed2): _wk(r,d+1)
+        _wk(repr_id)
+        if not pts: return None
+        xs=[p[0] for p in pts]; ys=[p[1] for p in pts]; zs=[p[2] for p in pts]
+        dx=max(xs)-min(xs); dy=max(ys)-min(ys)
+        eixo="X" if dx>=dy else "Y"
+        return (min(xs),max(xs),min(ys),max(ys),min(zs),max(zs),eixo)
+
+    def _viga_bbox3d_extruded(elem):
+        """Estima bbox 3D de viga com ExtrudedAreaSolid (v27) via placement + dims."""
+        try:
+            import ifcopenshell.util.placement as _pl
+            import numpy as _np
+            M = _pl.get_local_placement(elem.ObjectPlacement)
+            ox,oy,oz = float(M[0,3]),float(M[1,3]),float(M[2,3])
+            # Vetor direção da viga = coluna 0 da matriz (eixo X local)
+            dx_,dy_ = float(M[0,0]),float(M[1,0])
+            larg = _dim(elem,"Largura") or 14.
+            alt  = _dim(elem,"Altura") or 35.
+            # Comprimento: tentar extrair do ExtrudedAreaSolid depth
+            comp = 0.0
+            try:
+                for rep in elem.Representation.Representations:
+                    for item in rep.Items:
+                        if item.is_a("IfcExtrudedAreaSolid"):
+                            comp = float(item.Depth); break
+                    if comp: break
+            except Exception: pass
+            if comp == 0.0: comp = 300.0  # fallback
+            # Calcular endpoints
+            ex,ey = ox+dx_*comp, oy+dy_*comp
+            xmin,xmax = min(ox,ex)-larg,max(ox,ex)+larg
+            ymin,ymax = min(oy,ey)-alt, max(oy,ey)+alt
+            zmin,zmax = oz-alt, oz+alt
+            eixo="X" if abs(dx_)>=abs(dy_) else "Y"
+            return (xmin,xmax,ymin,ymax,zmin,zmax,eixo)
+        except Exception:
+            return None
+
     TIPOS_STRUCT = ("IfcColumn","IfcBeam","IfcSlab","IfcFooting","IfcPile")
     for tipo in TIPOS_STRUCT:
         tipo_step = "IFC"+tipo[3:].upper()
         for elem in ifc_file.by_type(tipo):
+            eid_str = str(elem.id())
+
+            if tipo_step == "IFCBEAM":
+                # Tentar bbox 3D via Brep (v22) primeiro, depois ExtrudedAreaSolid (v27)
+                bb3 = _viga_bbox3d_brep(eid_str) or _viga_bbox3d_extruded(elem)
+                if bb3:
+                    viga_bbox3d[elem.id()] = bb3
+                continue  # vigas não usam elem_bbox
+
             center = _get_elem_center(elem)
             if center is None: continue
             cx,cy = center
             if tipo_step=="IFCCOLUMN":
                 b=_dim(elem,"Dimensao_b1") or 35.; h=_dim(elem,"Dimensao_h1") or 14.
-            elif tipo_step=="IFCBEAM":
-                b=_dim(elem,"Largura") or 14.; h=_dim(elem,"Altura") or 35.
             elif tipo_step=="IFCSLAB":
                 b,h = 600.,600.
             elif tipo_step=="IFCFOOTING":
                 b=_dim(elem,"Dimensoes_X") or _dim(elem,"Diametro") or 60.
                 h=_dim(elem,"Dimensoes_Y") or b
             else:
-                d=_dim(elem,"Diametro") or _dim(elem,"Dimensao_b1") or 30.
-                b,h=d,d
+                d2=_dim(elem,"Diametro") or _dim(elem,"Dimensao_b1") or 30.
+                b,h=d2,d2
             elem_bbox[elem.id()]=(cx,cy,b/2+TOLERANCIA_CM,h/2+TOLERANCIA_CM,tipo_step)
 
     # ── Passo 5: índice Numero+Planta para vigas/lajes (fallback) ────────────
@@ -510,20 +580,44 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
             xyz = _bar_xyz(barra)
             if xyz is not None:
                 bx,by,bz = xyz
-                best=None; best_dist=1e9
-                for e_id,(cx,cy,hb,hh,te) in elem_bbox.items():
-                    if te!=tipo_step: continue
-                    if storey_por_elem.get(e_id,"?")!=pav: continue
-                    if abs(bx-cx)<=hb and abs(by-cy)<=hh:
-                        d=math.sqrt((bx-cx)**2+(by-cy)**2)
-                        if d<best_dist: best_dist=d; best=e_id
-                if best:
-                    # Para estribos de pilar: guardar Z para calcular espaçamento
-                    if tipo_step=="IFCCOLUMN" and sub=="trans":
-                        cache[best].append((bitola,comp_cm,sub,round(bz,3)))
-                    else:
-                        cache[best].append((bitola,comp_cm,sub))
-                    vin_spatial+=1; continue
+
+                if tipo_step == "IFCBEAM":
+                    # Vigas: containment 3D via bbox do Brep/ExtrudedAreaSolid
+                    # Escolher o segmento com menor volume que contém a barra
+                    _TOL3 = 5.0
+                    best=None; best_vol=1e18; best_eixo="X"
+                    for e_id,(xmin,xmax,ymin,ymax,zmin,zmax,eixo) in viga_bbox3d.items():
+                        if storey_por_elem.get(e_id,"?")!=pav: continue
+                        if (xmin-_TOL3<=bx<=xmax+_TOL3 and
+                            ymin-_TOL3<=by<=ymax+_TOL3 and
+                            zmin-_TOL3<=bz<=zmax+_TOL3):
+                            vol=(xmax-xmin)*(ymax-ymin)*(zmax-zmin)
+                            if vol<best_vol: best_vol=vol; best=e_id; best_eixo=eixo
+                    if best:
+                        # Para estribos: guardar coord ao longo do eixo da viga
+                        if sub=="trans":
+                            coord_eixo = round(bx,3) if best_eixo=="X" else round(by,3)
+                            cache[best].append((bitola,comp_cm,sub,coord_eixo))
+                        else:
+                            cache[best].append((bitola,comp_cm,sub))
+                        vin_spatial+=1; continue
+                    # sem match → fallback Numero+Planta abaixo
+                else:
+                    # Pilares, fundações, estacas: containment 2D por bbox de seção
+                    best=None; best_dist=1e9
+                    for e_id,(cx,cy,hb,hh,te) in elem_bbox.items():
+                        if te!=tipo_step: continue
+                        if storey_por_elem.get(e_id,"?")!=pav: continue
+                        if abs(bx-cx)<=hb and abs(by-cy)<=hh:
+                            d2=math.sqrt((bx-cx)**2+(by-cy)**2)
+                            if d2<best_dist: best_dist=d2; best=e_id
+                    if best:
+                        # Para estribos de pilar: guardar Z para calcular espaçamento
+                        if tipo_step=="IFCCOLUMN" and sub=="trans":
+                            cache[best].append((bitola,comp_cm,sub,round(bz,3)))
+                        else:
+                            cache[best].append((bitola,comp_cm,sub))
+                        vin_spatial+=1; continue
                 # Sem match espacial — tentar Numero como fallback
             else:
                 sem_xy+=1
