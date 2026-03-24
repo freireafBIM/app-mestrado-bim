@@ -606,26 +606,10 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
 
         if len(segs) != 3: return None  # estrutura inesperada
 
-        gancho  = segs[0]["mag"]   # gancho entrada (= Box Height - raio)
-        corpo   = segs[1]["mag"]   # comprimento útil do eixo da barra
+        gancho  = segs[0]["mag"]   # gancho entrada
+        corpo   = segs[1]["mag"]   # comprimento útil
         gancho2 = segs[2]["mag"]   # gancho saída
-        # Box Length (Solibri) = corpo + diâmetro_fio
-        # É o comprimento externo do corpo — valor de referência do projeto
-        # Extrair raio do SweptDiskSolid para calcular diâmetro real
-        _diam_cm = 1.0  # padrão Ø10mm
-        _vis2 = set()
-        def _find_sds(pid, d=0):
-            nonlocal _diam_cm
-            if pid in _vis2 or pid not in _ents or d > 5: return
-            _vis2.add(pid); _et2,_ed2 = _ents[pid]
-            if _et2 == "IFCSWEPTDISKSOLID":
-                _parts2 = _ed2.split(",")
-                try: _diam_cm = abs(float(_parts2[1].strip())) * 2.0
-                except: pass
-                return
-            for _r in _re.findall(r"#(\d+)", _ed2): _find_sds(_r, d+1)
-        _find_sds(repr_id)
-        comp_total = corpo + _diam_cm  # Box Length = corpo + diâmetro
+        comp_total = gancho + corpo + gancho2  # comprimento total do fio
 
         xyz = segs[0]["p"]          # ponto inicial da barra (topo do gancho)
         px, py, pz = xyz
@@ -1162,42 +1146,6 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
         cache_arm, _viga_bbox3d_map = indexar_armaduras(ifc, caminho)
 
 
-    # ── 2a. Fusão de segmentos secundários de sapatas ────────────────────────
-    # Cada sapata TQS exporta 2 IfcFooting: um com Pset_TQS_Geometria (principal)
-    # e outro sem (secundário). Apenas o principal gera registro; o secundário
-    # é suprimido e suas barras transferidas ao principal.
-    NOS_SAPATAS: set[int] = set()
-
-    _sapatas_por_nome: dict = {}  # (nome, pav) → [eid_com_geo, eid_sem_geo]
-    for _elem in ifc_file.by_type("IfcFooting"):
-        _pav = decode_ifc(
-            (_elem.ContainedInStructure[0].RelatingStructure.Name or "")
-            if _elem.ContainedInStructure else ""
-        ) or "Sem pavimento"
-        _nome = _elem.Name or "S/N"
-        # Verificar se tem Pset_TQS_Geometria
-        _ps = _psets(_elem)
-        _tem_geo = bool(_ps.get("TQS_Geometria") or _ps.get("Pset_TQS_Geometria"))
-        _key = (_nome, _pav)
-        _sapatas_por_nome.setdefault(_key, {"principal": None, "secundarios": []})
-        if _tem_geo:
-            _sapatas_por_nome[_key]["principal"] = _elem.id()
-        else:
-            _sapatas_por_nome[_key]["secundarios"].append(_elem.id())
-
-    for _key, _info in _sapatas_por_nome.items():
-        _princ = _info["principal"]
-        for _sec_id in _info["secundarios"]:
-            NOS_SAPATAS.add(_sec_id)
-            if _princ and _sec_id in cache_arm:
-                # Transferir barras de sapata do secundário ao principal
-                cache_arm.setdefault(_princ, [])
-                cache_arm[_princ].extend(cache_arm[_sec_id])
-                del cache_arm[_sec_id]
-
-    if NOS_SAPATAS:
-        st.info(f"Sapatas: {len(NOS_SAPATAS)} segmento(s) secundário(s) suprimido(s).")
-
     # ── 2. Fusão de segmentos de nó de viga (≤ 20 cm) ────────────────────────
     # Segmentos curtos (≤ 20 cm) são trechos de sobreposição sobre pilares ou
     # outras vigas. Suas barras transversais são somadas ao vão adjacente maior
@@ -1285,10 +1233,6 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
 
             # Suprimir segmentos de nó de viga (já fundidos ao vão principal)
             if tipo_ifc == "IfcBeam" and elem.id() in NOS_VIGAS:
-                continue
-
-            # Suprimir segmentos secundários de sapatas
-            if tipo_ifc == "IfcFooting" and elem.id() in NOS_SAPATAS:
                 continue
 
             nome     = elem.Name or "S/N"
