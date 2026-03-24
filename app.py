@@ -289,7 +289,7 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         "Armadura longitudinal positiva lajes":"long",
         "Armadura longitudinal negativa lajes":"long",
         "Armadura longitudinal lajes secund\u00e1ria":"long",
-        "Armadura de funda\u00e7\u00f5es":"long",
+        "Armadura de funda\u00e7\u00f5es":"sapata",
         "Armadura de estacas":"long",
     }
     TIPOS_SPATIAL = {"IFCCOLUMN","IFCFOOTING","IFCPILE","IFCBEAM","IFCSLAB"}
@@ -542,6 +542,87 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         r = _bar_xyz(barra)
         return (r[0], r[1]) if r else None
 
+    # ── Extrator especializado para barras de sapata (CompositeCurve 3 segs) ──
+    # Cada barra de fundação TQS tem 3 segmentos em U:
+    #   Seg 0: gancho entrada (IfcLine vertical, magnitude = gancho_cm)
+    #   Seg 1: corpo principal (IfcLine horizontal, magnitude = corpo_cm)
+    #   Seg 2: gancho saída   (IfcLine vertical, magnitude = gancho_cm)
+    # comp_total = gancho_entrada + corpo + gancho_saída  (comprimento real do fio)
+    # direcao = "P1" ou "P2" lido do nome da barra
+    # coord_dist = coordenada de distribuição (perpendicular ao corpo)
+    def _bar_sapata(barra):
+        """Retorna (xyz, comp_total_cm, direcao_str, coord_dist) ou None."""
+        if not getattr(barra, "Representation", None): return None
+        eid_str = str(barra.id())
+        if not _use_manual or eid_str not in _ents: return None
+
+        et,ed = _ents[eid_str]
+        parts = ed.split(",")
+        repr_id = parts[6].strip().lstrip("#") if len(parts)>6 else ""
+        if repr_id not in _ents: return None
+
+        # Navegar até CompositeCurve
+        cc_id = [None]; vis = set()
+        def _find_cc(pid, d=0):
+            if cc_id[0] or pid in vis or pid not in _ents or d>6: return
+            vis.add(pid); et2,ed2 = _ents[pid]
+            if et2 == "IFCCOMPOSITECURVE": cc_id[0] = pid; return
+            for r in _re.findall(r"#(\d+)", ed2): _find_cc(r, d+1)
+        _find_cc(repr_id)
+        if not cc_id[0]: return None
+
+        cc_et, cc_ed = _ents[cc_id[0]]
+        # Extrair ids dos CompositeCurveSegments
+        seg_refs = _re.findall(r"#(\d+)", cc_ed.split(",(")[1] if ",(" in cc_ed else cc_ed)
+        segs = []
+        for sid in seg_refs:
+            if sid not in _ents: continue
+            st,sd = _ents[sid]
+            if st != "IFCCOMPOSITECURVESEGMENT": continue
+            line_id = _re.findall(r"#(\d+)", sd)[-1]
+            if line_id not in _ents: continue
+            lt,ld = _ents[line_id]
+            if lt != "IFCLINE": continue
+            refs = _re.findall(r"#(\d+)", ld)
+            if len(refs) < 2: continue
+            pnt_id, vec_id = refs[0], refs[1]
+            # Ponto inicial
+            pt_et, pt_ed = _ents.get(pnt_id, ("",""))
+            coords = _re.findall(r"[-\d.E+]+", pt_ed)
+            if len(coords) < 3: continue
+            px,py,pz = float(coords[0]),float(coords[1]),float(coords[2])
+            # Vetor magnitude
+            vec_et, vec_ed = _ents.get(vec_id, ("",""))
+            vec_parts = vec_ed.split(",")
+            try: mag = abs(float(vec_parts[-1].strip()))
+            except: continue
+            # Direcao do vetor
+            dir_refs = _re.findall(r"#(\d+)", vec_ed)
+            dx,dy,dz = 0.0,0.0,0.0
+            if dir_refs and dir_refs[0] in _ents:
+                dc = _re.findall(r"[-\d.E+]+", _ents[dir_refs[0]][1])
+                if len(dc)>=3: dx,dy,dz = float(dc[0]),float(dc[1]),float(dc[2])
+            segs.append({"p":(px,py,pz),"mag":mag,"d":(dx,dy,dz)})
+
+        if len(segs) != 3: return None  # estrutura inesperada
+
+        gancho  = segs[0]["mag"]   # gancho entrada
+        corpo   = segs[1]["mag"]   # comprimento útil
+        gancho2 = segs[2]["mag"]   # gancho saída
+        comp_total = gancho + corpo + gancho2  # comprimento total do fio
+
+        xyz = segs[0]["p"]          # ponto inicial da barra (topo do gancho)
+        px, py, pz = xyz
+
+        # Direção do corpo (seg 1): P1 = maior componente X, P2 = maior Y
+        ddx, ddy, ddz = segs[1]["d"]
+        direcao = "P1" if abs(ddx) >= abs(ddy) else "P2"
+
+        # coord_dist = posição de distribuição (perpendicular ao eixo do corpo)
+        coord_dist = round(py,3) if direcao == "P1" else round(px,3)
+
+        return (px, py, pz), round(comp_total, 2), direcao, coord_dist
+
     # ── Passo 7: Numero+Planta da barra (fallback para vigas/lajes) ──────────
     def _bar_num_planta(barra):
         p=_psets(barra).get("TQS_Padrao",{})
@@ -611,8 +692,26 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                             cache[best].append((bitola,comp_cm,sub))
                         vin_spatial+=1; continue
                     # sem match → fallback Numero+Planta abaixo
+                elif tipo_step == "IFCFOOTING":
+                    # Sapatas: extrator especializado — lê comp total e direção
+                    # do CompositeCurve (3 segs: gancho+corpo+gancho)
+                    _sd = _bar_sapata(barra)
+                    if _sd:
+                        (bx,by,bz), comp_total, direcao, coord_dist = _sd
+                        best=None; best_dist=1e9
+                        for e_id,(cx,cy,hb,hh,te) in elem_bbox.items():
+                            if te!="IFCFOOTING": continue
+                            if storey_por_elem.get(e_id,"?")!=pav: continue
+                            if abs(bx-cx)<=hb and abs(by-cy)<=hh:
+                                d2=math.sqrt((bx-cx)**2+(by-cy)**2)
+                                if d2<best_dist: best_dist=d2; best=e_id
+                        if best:
+                            # (bitola, comp_total, "sapata", direcao, coord_dist)
+                            cache[best].append((bitola, comp_total, "sapata",
+                                                direcao, coord_dist))
+                            vin_spatial+=1; continue
                 else:
-                    # Pilares, fundações, estacas: containment 2D por bbox de seção
+                    # Pilares e estacas: containment 2D por bbox de seção
                     best=None; best_dist=1e9
                     for e_id,(cx,cy,hb,hh,te) in elem_bbox.items():
                         if te!=tipo_step: continue
@@ -669,17 +768,25 @@ def peso_linear_kg_m(diam_mm: float) -> float:
 
 
 def _parse_barra(b):
-    """Normaliza entrada do cache: retorna (bitola, comp_cm, sub_tipo, z_cm).
-    Aceita tuplas de 3 (sem Z) ou 4 campos (com Z), e também float simples.
+    """Normaliza entrada do cache: retorna (bitola, comp_cm, sub_tipo, coord, extra).
+    Formatos suportados:
+      5 campos: (bitola, comp, "sapata", direcao_str, coord_dist)
+      4 campos: (bitola, comp, sub, z_ou_coord)
+      3 campos: (bitola, comp, sub)
+      2 campos: (bitola, comp)
+      float:    bitola simples (retrocompat.)
+    Retorna sempre 5 valores: (bitola, comp, sub, coord_or_dir, extra)
     """
     if isinstance(b, tuple):
+        if len(b) == 5:
+            return float(b[0]), float(b[1]), str(b[2]), b[3], b[4]
         if len(b) == 4:
-            return float(b[0]), float(b[1]), str(b[2]), float(b[3])
+            return float(b[0]), float(b[1]), str(b[2]), float(b[3]), None
         if len(b) == 3:
-            return float(b[0]), float(b[1]), str(b[2]), None
+            return float(b[0]), float(b[1]), str(b[2]), None, None
         if len(b) == 2:
-            return float(b[0]), float(b[1]), "long", None
-    return float(b), 0.0, "long", None
+            return float(b[0]), float(b[1]), "long", None, None
+    return float(b), 0.0, "long", None, None
 
 
 def _espaçamento_estribos(zs: list[float]) -> int:
@@ -711,16 +818,15 @@ def formatar_armadura(cache: dict, elem_eid: int) -> str:
 
     barras = cache[elem_eid]
     long_list  = []   # (bitola, comp_cm)
-    trans_list = []   # (bitola, comp_cm, z_cm|None)
 
     for b in barras:
-        d, c, sub, z = _parse_barra(b)
+        d, c, sub, coord, extra = _parse_barra(b)
         if sub == "long":
             long_list.append((d, c))
-        else:
-            trans_list.append((d, c, z))
 
-    if not long_list and not trans_list:
+    if not long_list and not any(
+        _parse_barra(b)[2] in ("trans","sapata") for b in barras
+    ):
         return "Sem armadura exportada"
 
     # ── Longitudinal ──────────────────────────────────────────────────────────
@@ -737,11 +843,40 @@ def formatar_armadura(cache: dict, elem_eid: int) -> str:
             long_parts.append(f"{q}Ø{d:.0f}")
     long_str = " + ".join(long_parts) if long_parts else "—"
 
-    # ── Transversal ───────────────────────────────────────────────────────────
+    # ── Sapata: tratamento especial — barras em duas direções ────────────────
+    sapata_list = []
+    for b in barras:
+        d, c, sub, coord_or_dir, extra = _parse_barra(b)
+        if sub == "sapata":
+            sapata_list.append((d, c, coord_or_dir, extra))  # (bitola, comp, direcao, coord_dist)
+
+    if sapata_list:
+        # Agrupar por (bitola, comp, direcao) → calcular qtd e espaçamento
+        grupos_sap: dict = defaultdict(list)
+        for d, c, direcao, coord in sapata_list:
+            grupos_sap[(d, round(c, 1), direcao)].append(coord)
+
+        dir_parts = {}
+        for (d, c, direcao), coords in grupos_sap.items():
+            q = len(coords)
+            coords_v = [x for x in coords if x is not None]
+            esp = _espaçamento_estribos(coords_v) if len(coords_v) > 1 else 0
+            s = f"{q}Ø{d:.0f}(C={c:.0f}cm)"
+            if esp: s += f"@{esp}cm"
+            dir_parts.setdefault(direcao, []).append(s)
+
+        sap_str_parts = []
+        for direcao in sorted(dir_parts.keys()):  # P1 antes P2
+            sap_str_parts.append(f"{direcao}: {' + '.join(dir_parts[direcao])}")
+        return " | ".join(sap_str_parts)
+
+    # ── Transversal (pilares/vigas) ────────────────────────────────────────────
     # Agrupar por (bitola, comp) → cada grupo é um tipo de estribo
     grupos_trans: dict = defaultdict(list)   # (d, c) → [z, z, ...]
-    for d, c, z in trans_list:
-        grupos_trans[(d, c)].append(z)
+    for b in barras:
+        d, c, sub, coord, _ = _parse_barra(b)
+        if sub == "trans":
+            grupos_trans[(d, c)].append(coord)
 
     trans_parts = []
     for (d, c), zs in sorted(grupos_trans.items(), key=lambda x: -x[0][1]):
@@ -778,13 +913,16 @@ def detalhar_armadura(cache: dict, elem_eid: int) -> dict:
     barras = cache[elem_eid]
     long_list  = []
     trans_list = []
+    sapata_list = []
 
     for b in barras:
-        d, c, sub, z = _parse_barra(b)
+        d, c, sub, coord, extra = _parse_barra(b)
         if sub == "long":
             long_list.append((d, c))
+        elif sub == "sapata":
+            sapata_list.append((d, c, coord, extra))  # (bitola, comp, direcao, coord_dist)
         else:
-            trans_list.append((d, c, z))
+            trans_list.append((d, c, coord))
 
     # Longitudinal
     gl: dict = defaultdict(int)
@@ -799,6 +937,23 @@ def detalhar_armadura(cache: dict, elem_eid: int) -> dict:
     gt: dict = defaultdict(list)
     for d, c, z in trans_list:
         gt[(d, c)].append(z)
+
+    # Sapata: agrupar por (bitola, comp, direcao)
+    if sapata_list:
+        gs: dict = defaultdict(list)
+        for d, c, direcao, coord in sapata_list:
+            gs[(d, round(c,1), direcao)].append(coord)
+        sap_parts = []
+        for (d, c, direcao), coords in sorted(gs.items()):
+            q = len(coords)
+            coords_v = [x for x in coords if x is not None]
+            esp = _espaçamento_estribos(coords_v) if len(coords_v)>1 else None
+            s = f"{q}Ø{d:.0f}(C={c:.0f}cm)"
+            if esp: s += f"@{esp}cm"
+            sap_parts.append(f"{direcao}: {s}")
+        sap_str = " | ".join(sap_parts)
+    else:
+        sap_str = ""
     trans_parts = []
     for (d, c), zs in sorted(gt.items(), key=lambda x: -x[0][1]):
         q = len(zs); zs_v = [z for z in zs if z is not None]
