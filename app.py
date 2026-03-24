@@ -22,7 +22,7 @@ Estrutura de Psets TQS confirmada neste modelo:
   TQS_Geometria → Secao, Dimensao_b1, Dimensao_h1, Largura, Altura,
                   Dimensoes_X, Dimensoes_Y, Area, Area_superficie,
                   Carga_linear, Carga_distribuida, Estacas, Diametro
-  TQS_Armaduras → Cobrimento, Tem_Protensao
+  TQS_Armaduras → Tem_Protensao
   IfcReinforcingBar.Name → "QTD NOME_ELEM ØDiam C=Comp"
 """
 
@@ -969,22 +969,6 @@ def _id_unico(elem, id_projeto: str, pavimento: str) -> str:
     return f"{proj}-{pav}-{nome}-{guid}"
 
 
-def _volume_m3(geo: dict, tipo_ifc: str) -> float:
-    """
-    Estima volume de concreto em m³ a partir da bounding box.
-    Pilares/Estacas: Área_seção × Altura
-    Vigas: Largura × Altura × Comprimento
-    Lajes: Comprimento × Largura × Altura (espessura)
-    Fundações: usa dimensões X, Y, Altura quando disponíveis via Pset.
-    Unidade entrada: cm → saída: m³
-    """
-    c = geo["comp_cm"] / 100
-    l = geo["larg_cm"] / 100
-    a = geo["alt_cm"]  / 100
-    if c > 0 and l > 0 and a > 0:
-        return round(c * l * a, 4)
-    return 0.0
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PIPELINE PRINCIPAL DE EXTRAÇÃO
@@ -1100,7 +1084,6 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
             pavimento = _pavimento(elem)
             geo      = _bbox(elem)
             ps       = _psets(elem)
-            volume   = _volume_m3(geo, tipo_ifc)
 
             # ── Extrair campos específicos dos Psets TQS ──────────────────────
             # Compatibilidade entre versões TQS:
@@ -1132,8 +1115,6 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 except Exception:
                     pass
 
-            # Cobrimento: v27 → TQS_Armaduras.Cobrimento; v22 nao tem Pset_TQS_Armaduras
-            cobrimento = get("TQS_Armaduras.Cobrimento")
             protensao  = get("TQS_Armaduras.Tem_Protensao")
 
             # Geometria especifica por tipo (Pset tem precedencia sobre bbox)
@@ -1180,38 +1161,6 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 descricao_geo = (f"{geo['comp_cm']:.0f}x{geo['larg_cm']:.0f}x"
                                  f"{geo['alt_cm']:.0f} cm")
 
-            # Volume: _bbox retorna zero para FacetedBrep (v22) — recalcular
-            # a partir dos Psets quando disponivel.
-            if volume == 0.0:
-                try:
-                    if tipo_ifc == "IfcColumn":
-                        b_cm  = float(get("TQS_Geometria.Dimensao_b1") or 0)
-                        h_cm  = float(get("TQS_Geometria.Dimensao_h1") or 0)
-                        a_cm  = geo["alt_cm"] or float(get("TQS_Geometria.Altura") or 0)
-                        if b_cm and h_cm and a_cm:
-                            volume = round(b_cm * h_cm * a_cm / 1e6, 4)
-                    elif tipo_ifc == "IfcBeam":
-                        larg = float(get("TQS_Geometria.Largura") or 0)
-                        alt  = float(get("TQS_Geometria.Altura") or 0)
-                        comp = geo["comp_cm"]
-                        if larg and alt and comp:
-                            volume = round(larg * alt * comp / 1e6, 4)
-                    elif tipo_ifc == "IfcSlab":
-                        esp_cm = float(get("TQS_Geometria.Altura",
-                                          "TQS_Geometria.Capa") or 0)
-                        ar = float(get("TQS_Geometria.Area_superficie") or 0)
-                        if not ar and geo["comp_cm"] and geo["larg_cm"]:
-                            ar = geo["comp_cm"] * geo["larg_cm"] / 1e4
-                        if esp_cm and ar:
-                            volume = round(esp_cm / 100 * ar, 4)
-                    elif tipo_ifc == "IfcFooting":
-                        dx = float(get("TQS_Geometria.Dimensoes_X") or 0)
-                        dy = float(get("TQS_Geometria.Dimensoes_Y") or 0)
-                        dz = float(get("TQS_Geometria.Altura") or 0)
-                        if dx and dy and dz:
-                            volume = round(dx * dy * dz / 1e6, 4)
-                except Exception:
-                    pass
 
             armadura = formatar_armadura(cache_arm, elem.id())
 
@@ -1225,10 +1174,8 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 "Pavimento":        pavimento,
                 "Material":         material,
                 "Geometria":        descricao_geo,
-                "Cobrimento_cm":    cobrimento,
                 "Armadura":         armadura,
                 "Tem_Protensao":    protensao,
-                "Volume_m3":        volume,
                 "Geo_Comp_cm":      geo["comp_cm"],
                 "Geo_Larg_cm":      geo["larg_cm"],
                 "Geo_Alt_cm":       geo["alt_cm"],
@@ -1391,14 +1338,12 @@ def salvar_no_sheets(client: gspread.Client, id_proj: str,
         df_p = df_p[df_p["ID_Projeto"] != id_proj]
 
     tipos_count = Counter(r["Tipo_Legivel"] for r in registros)
-    vol_total = round(sum(r.get("Volume_m3", 0) for r in registros), 3)
 
     novo = {
         "ID_Projeto":          id_proj,
         "Nome_Obra":           nome,
         "Data_Upload":         datetime.datetime.now().strftime("%d/%m/%Y %H:%M"),
         "Total_Elementos":     len(registros),
-        "Volume_Total_m3":     vol_total,
         "Resumo_Tipos":        " | ".join(f"{t}: {n}" for t, n in tipos_count.items()),
     }
     df_p = pd.concat([df_p, pd.DataFrame([novo])], ignore_index=True).fillna("").astype(str)
@@ -1512,10 +1457,7 @@ def _tela_principal() -> None:
 
     # Métricas de resumo
     tipos_count = Counter(r["Tipo_Legivel"] for r in registros)
-    vol_total   = round(sum(r.get("Volume_m3", 0) for r in registros), 2)
-
-    # Monta lista de métricas: todos os tipos + volume total
-    metricas = list(tipos_count.items()) + [("Volume total (m³)", vol_total)]
+    metricas = list(tipos_count.items())
     N_COLS = 4  # número fixo de colunas — nunca estoura o índice
     cols = st.columns(N_COLS)
     for i, (label, valor) in enumerate(metricas):
@@ -1530,7 +1472,7 @@ def _tela_principal() -> None:
 
     st.divider()
     colunas_view = ["Nome", "Tipo_Legivel", "Pavimento", "Geometria",
-                    "Armadura", "Material", "Cobrimento_cm", "Volume_m3", "Status"]
+                    "Armadura", "Material", "Status"]
     df_view = pd.DataFrame(filtrados)[
         [c for c in colunas_view if c in pd.DataFrame(filtrados).columns]
     ]
