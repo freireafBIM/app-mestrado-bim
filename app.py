@@ -429,8 +429,9 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                 key=(num,planta,tipo_step)
                 elem_num_idx.setdefault(key,[]).append(elem.id())
 
-    # ── Passo 6: ponto inicial (x,y) da barra via SweptDiskSolid ─────────────
-    def _bar_xy(barra) -> tuple | None:
+    # ── Passo 6: ponto inicial (x,y,z) da barra via SweptDiskSolid ───────────
+    # Retorna (x, y, z). Para compatibilidade, o chamador usa só (x,y) ou (x,y,z).
+    def _bar_xyz(barra) -> tuple | None:
         if not getattr(barra,"Representation",None): return None
         vis=set()
         def _wk(obj,d=0):
@@ -442,7 +443,9 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
             t=obj.is_a()
             if t=="IfcCartesianPoint":
                 c=obj.Coordinates
-                return (float(c[0]),float(c[1])) if c and len(c)>=2 else None
+                if not c or len(c)<2: return None
+                z = float(c[2]) if len(c)>=3 else 0.0
+                return (float(c[0]),float(c[1]),z)
             if t=="IfcSweptDiskSolid": return _wk(obj.Directrix,d+1)
             if t=="IfcCompositeCurve":
                 for seg in (obj.Segments or []):
@@ -463,6 +466,11 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                 pt=_wk(item)
                 if pt: return pt
         return None
+
+    # Alias para compatibilidade: só (x,y)
+    def _bar_xy(barra):
+        r = _bar_xyz(barra)
+        return (r[0], r[1]) if r else None
 
     # ── Passo 7: Numero+Planta da barra (fallback para vigas/lajes) ──────────
     def _bar_num_planta(barra):
@@ -499,9 +507,9 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
             pav = storey_por_elem.get(barra.id(),"Sem pavimento")
 
             # — Método 1: containment espacial ─────────────────────────────
-            xy = _bar_xy(barra)
-            if xy is not None:
-                bx,by = xy
+            xyz = _bar_xyz(barra)
+            if xyz is not None:
+                bx,by,bz = xyz
                 best=None; best_dist=1e9
                 for e_id,(cx,cy,hb,hh,te) in elem_bbox.items():
                     if te!=tipo_step: continue
@@ -510,7 +518,11 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                         d=math.sqrt((bx-cx)**2+(by-cy)**2)
                         if d<best_dist: best_dist=d; best=e_id
                 if best:
-                    cache[best].append((bitola,comp_cm,sub))
+                    # Para estribos de pilar: guardar Z para calcular espaçamento
+                    if tipo_step=="IFCCOLUMN" and sub=="trans":
+                        cache[best].append((bitola,comp_cm,sub,round(bz,3)))
+                    else:
+                        cache[best].append((bitola,comp_cm,sub))
                     vin_spatial+=1; continue
                 # Sem match espacial — tentar Numero como fallback
             else:
@@ -553,107 +565,185 @@ def peso_linear_kg_m(diam_mm: float) -> float:
     return diam_mm ** 2 * 0.00617
 
 
+def _parse_barra(b):
+    """Normaliza entrada do cache: retorna (bitola, comp_cm, sub_tipo, z_cm).
+    Aceita tuplas de 3 (sem Z) ou 4 campos (com Z), e também float simples.
+    """
+    if isinstance(b, tuple):
+        if len(b) == 4:
+            return float(b[0]), float(b[1]), str(b[2]), float(b[3])
+        if len(b) == 3:
+            return float(b[0]), float(b[1]), str(b[2]), None
+        if len(b) == 2:
+            return float(b[0]), float(b[1]), "long", None
+    return float(b), 0.0, "long", None
+
+
+def _espaçamento_estribos(zs: list[float]) -> int:
+    """Calcula espaçamento nominal (cm, inteiro) a partir das alturas Z dos estribos.
+    Mede distância c/c e arredonda para inteiro — recupera o valor nominal de projeto.
+    """
+    if len(zs) < 2:
+        return 0
+    zs_ord = sorted(zs)
+    diffs = [zs_ord[i+1] - zs_ord[i] for i in range(len(zs_ord)-1)]
+    return round(sum(diffs) / len(diffs))
+
+
 def formatar_armadura(cache: dict, elem_eid: int) -> str:
     """
-    Retorna a armadura longitudinal formatada (string resumida).
-    Exemplo: "12 ø16.0 + 8 ø10.0"  — bitolas maiores primeiro.
-    Exibe apenas barras longitudinais (sub_tipo == "long") para
-    compatibilidade com a coluna "Armadura" do Sheets.
+    Monta o campo Armadura completo com longitudinal e transversal.
+
+    Pilares — formato:
+      Long: 6Ø10(C=356cm) | Trans: 26Ø5(C=104cm)@12cm + 26Ø5(C=20cm)@12cm
+
+    Outros elementos — formato:
+      Long: 12Ø16 + 8Ø10 | Trans: 60Ø5
+
+    Para pilares o espaçamento é calculado pelas coordenadas Z dos estribos.
+    Para outros elementos o espaçamento não está disponível no IFC.
     """
     if elem_eid not in cache:
         return "Sem armadura exportada"
+
     barras = cache[elem_eid]
-    # Suporta tanto (bitola, comp, sub) quanto bitola simples (retrocompat.)
-    long_barras = [b[0] if isinstance(b, tuple) else b
-                   for b in barras
-                   if not isinstance(b, tuple) or b[2] == "long"]
-    if not long_barras:
-        # Fallback: mostrar qualquer barra se não houver longitudinal
-        long_barras = [b[0] if isinstance(b, tuple) else b for b in barras]
-    if not long_barras:
+    long_list  = []   # (bitola, comp_cm)
+    trans_list = []   # (bitola, comp_cm, z_cm|None)
+
+    for b in barras:
+        d, c, sub, z = _parse_barra(b)
+        if sub == "long":
+            long_list.append((d, c))
+        else:
+            trans_list.append((d, c, z))
+
+    if not long_list and not trans_list:
         return "Sem armadura exportada"
-    contagem = Counter(long_barras)
-    partes = sorted(contagem.items(), key=lambda x: -x[0])
-    return " + ".join(f"{qtd} ø{diam:.1f}" for diam, qtd in partes)
+
+    # ── Longitudinal ──────────────────────────────────────────────────────────
+    # Agrupar por (bitola, comp) para mostrar "qtd Ø bitola (C=comp cm)"
+    grupos_long: dict = defaultdict(int)
+    for d, c in long_list:
+        grupos_long[(d, c)] += 1
+
+    long_parts = []
+    for (d, c), q in sorted(grupos_long.items(), key=lambda x: -x[0][0]):
+        if c > 0:
+            long_parts.append(f"{q}Ø{d:.0f}(C={c:.0f}cm)")
+        else:
+            long_parts.append(f"{q}Ø{d:.0f}")
+    long_str = " + ".join(long_parts) if long_parts else "—"
+
+    # ── Transversal ───────────────────────────────────────────────────────────
+    # Agrupar por (bitola, comp) → cada grupo é um tipo de estribo
+    grupos_trans: dict = defaultdict(list)   # (d, c) → [z, z, ...]
+    for d, c, z in trans_list:
+        grupos_trans[(d, c)].append(z)
+
+    trans_parts = []
+    for (d, c), zs in sorted(grupos_trans.items(), key=lambda x: -x[0][1]):
+        q = len(zs)
+        zs_validos = [z for z in zs if z is not None]
+        if zs_validos:
+            esp = _espaçamento_estribos(zs_validos)
+            trans_parts.append(f"{q}Ø{d:.0f}(C={c:.0f}cm)@{esp}cm")
+        else:
+            if c > 0:
+                trans_parts.append(f"{q}Ø{d:.0f}(C={c:.0f}cm)")
+            else:
+                trans_parts.append(f"{q}Ø{d:.0f}")
+    trans_str = " + ".join(trans_parts) if trans_parts else "—"
+
+    return f"Long: {long_str} | Trans: {trans_str}"
 
 
 def detalhar_armadura(cache: dict, elem_eid: int) -> dict:
     """
-    Retorna detalhamento completo da armadura de um elemento:
+    Retorna detalhamento completo da armadura para uso interno/UI:
     {
-      "longitudinal":   "12 ø16.0(CA-50) + 60 ø10.0(CA-50)",
-      "transversal":    "184 ø5.0(CA-60)",
-      "comp_total_m":   328.7,
-      "peso_total_kg":  266.8,
-      "por_bitola": [
-          {"bitola": 16.0, "grau": "CA-50", "qtd": 12,
-           "comp_unit_cm": 355.0, "comp_total_m": 42.6, "peso_kg": 67.3},
-          ...
-      ]
+      "longitudinal":   "6Ø10(C=356cm)",
+      "transversal":    "26Ø5(C=104cm)@12cm + 26Ø5(C=20cm)@12cm",
+      "comp_total_m":   ...,
+      "peso_total_kg":  ...,
+      "por_bitola": [ {"bitola", "grau", "qtd", "comp_unit_cm",
+                        "comp_total_m", "peso_kg", "espaçamento_cm"}, ...]
     }
-    Conforme metodologia de Maciel (2018): comprimento unitário extraído do
-    atributo Name da IfcReinforcingBar (campo C=); grau de aço derivado da
-    bitola segundo NBR 7480 (CA-50 para Ø>6mm, CA-60 para Ø≤6mm).
     """
     if elem_eid not in cache:
         return {}
 
     barras = cache[elem_eid]
-    long_list  : list[tuple] = []
-    trans_list : list[tuple] = []
+    long_list  = []
+    trans_list = []
 
     for b in barras:
-        if isinstance(b, tuple):
-            bitola, comp_cm, sub = b
-        else:
-            bitola, comp_cm, sub = b, 0.0, "long"
-
+        d, c, sub, z = _parse_barra(b)
         if sub == "long":
-            long_list.append((bitola, comp_cm))
+            long_list.append((d, c))
         else:
-            trans_list.append((bitola, comp_cm))
+            trans_list.append((d, c, z))
 
-    def _fmt_com_grau(lst: list[tuple]) -> str:
-        c = Counter(d for d, _ in lst)
-        return " + ".join(
-            f"{q} ø{d:.1f}({grau_aco(d)})"
-            for d, q in sorted(c.items(), key=lambda x: -x[0])
-        ) if c else "—"
+    # Longitudinal
+    gl: dict = defaultdict(int)
+    for d, c in long_list:
+        gl[(d, c)] += 1
+    long_parts = []
+    for (d, c), q in sorted(gl.items(), key=lambda x: -x[0][0]):
+        long_parts.append(f"{q}Ø{d:.0f}(C={c:.0f}cm)" if c > 0 else f"{q}Ø{d:.0f}")
+    long_str = " + ".join(long_parts) if long_parts else "—"
 
-    def _por_bitola(lst: list[tuple]) -> list[dict]:
-        agrup: dict[float, list[float]] = defaultdict(list)
-        for d, c in lst:
-            agrup[d].append(c)
-        resultado = []
-        for d in sorted(agrup, reverse=True):
-            comps = agrup[d]
-            # Ignorar barras com C=0 no cálculo de peso/comprimento
-            comps_validos = [c for c in comps if c > 0]
-            comp_total_m = sum(comps_validos) / 100.0
-            peso_kg = peso_linear_kg_m(d) * comp_total_m
-            resultado.append({
-                "bitola":       d,
-                "grau":         grau_aco(d),
-                "qtd":          len(comps),
-                "comp_unit_cm": round(comps_validos[0], 2) if comps_validos else 0.0,
-                "comp_total_m": round(comp_total_m, 2),
-                "peso_kg":      round(peso_kg, 3),
-            })
-        return resultado
+    # Transversal
+    gt: dict = defaultdict(list)
+    for d, c, z in trans_list:
+        gt[(d, c)].append(z)
+    trans_parts = []
+    for (d, c), zs in sorted(gt.items(), key=lambda x: -x[0][1]):
+        q = len(zs); zs_v = [z for z in zs if z is not None]
+        esp = _espaçamento_estribos(zs_v) if zs_v else None
+        s = f"{q}Ø{d:.0f}(C={c:.0f}cm)" if c > 0 else f"{q}Ø{d:.0f}"
+        if esp: s += f"@{esp}cm"
+        trans_parts.append(s)
+    trans_str = " + ".join(trans_parts) if trans_parts else "—"
 
-    todas = long_list + trans_list
-    comp_total_m  = sum(c for _, c in todas if c > 0) / 100.0
-    peso_total_kg = sum(
-        peso_linear_kg_m(d) * (c / 100.0)
-        for d, c in todas if c > 0
-    )
+    # por_bitola — para fins de quantitativo detalhado
+    por_bitola = []
+    # Chave: (bitola, comp_unitario, sub_tipo) — separa tipos distintos de estribo
+    todos_grupos: dict = defaultdict(lambda: {"comps": [], "zs": [], "sub": "long"})
+    for d, c in long_list:
+        todos_grupos[(d, c, "long")]["comps"].append(c)
+        todos_grupos[(d, c, "long")]["sub"] = "long"
+    for d, c, z in trans_list:
+        todos_grupos[(d, c, "trans")]["comps"].append(c)
+        todos_grupos[(d, c, "trans")]["zs"].append(z)
+        todos_grupos[(d, c, "trans")]["sub"] = "trans"
+
+    for (d, _comp, sub), v in sorted(todos_grupos.items(), key=lambda x: (-x[0][0], -x[0][1])):
+        comps_v = [c for c in v["comps"] if c > 0]
+        comp_total_m = sum(comps_v) / 100.0
+        peso_kg = peso_linear_kg_m(d) * comp_total_m
+        zs_v = [z for z in v["zs"] if z is not None]
+        esp = _espaçamento_estribos(zs_v) if zs_v else None
+        por_bitola.append({
+            "bitola":          d,
+            "grau":            grau_aco(d),
+            "sub_tipo":        sub,
+            "qtd":             len(v["comps"]),
+            "comp_unit_cm":    round(comps_v[0], 1) if comps_v else 0.0,
+            "comp_total_m":    round(comp_total_m, 2),
+            "peso_kg":         round(peso_kg, 3),
+            "espaçamento_cm":  esp,
+        })
+
+    todas_comps = [(d, c) for d, c in long_list] +                   [(d, c) for d, c, _ in trans_list]
+    comp_total_m  = sum(c for _, c in todas_comps if c > 0) / 100.0
+    peso_total_kg = sum(peso_linear_kg_m(d)*(c/100) for d,c in todas_comps if c>0)
 
     return {
-        "longitudinal":  _fmt_com_grau(long_list),
-        "transversal":   _fmt_com_grau(trans_list),
+        "longitudinal":  long_str,
+        "transversal":   trans_str,
         "comp_total_m":  round(comp_total_m, 2),
         "peso_total_kg": round(peso_total_kg, 3),
-        "por_bitola":    _por_bitola(todas),
+        "por_bitola":    por_bitola,
     }
 
 
