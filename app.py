@@ -1263,31 +1263,69 @@ def gerar_pdf(registros: list[dict], nome_projeto: str) -> io.BytesIO:
         # ── Armaduras: separar Long / Trans pelo delimitador " | " ─────────
         arm_raw = reg["Armadura"]
         if " | " in arm_raw:
-            arm_long, arm_trans = arm_raw.split(" | ", 1)
+            _arm_long_raw, _arm_trans_raw = arm_raw.split(" | ", 1)
         else:
-            arm_long  = arm_raw
-            arm_trans = ""
+            _arm_long_raw  = arm_raw
+            _arm_trans_raw = ""
 
-        # Remover prefixos "Long: " / "Trans: " para exibição compacta
-        arm_long_txt  = arm_long.replace("Long: ", "").strip()
-        arm_trans_txt = arm_trans.replace("Trans: ", "").strip()
+        # Prefixar corretamente com "Long:" e "Transv:"
+        _long_label  = _arm_long_raw  if _arm_long_raw.startswith("Long:")  else f"Long: {_arm_long_raw}"
+        _trans_label = _arm_trans_raw if _arm_trans_raw.startswith("Trans:") else (f"Transv: {_arm_trans_raw}" if _arm_trans_raw else "")
+        # Normalizar "Trans:" → "Transv:" para melhor leitura
+        _trans_label = _trans_label.replace("Trans: ", "Transv: ", 1)
 
-        # Linha "Armaduras" em negrito
+        # Quebra de linha automática em " + " (max 33 chars por linha)
+        def _quebrar(texto, mc=33):
+            if not texto or len(texto) <= mc:
+                return [texto] if texto else []
+            linhas = []
+            while len(texto) > mc:
+                pos = texto.rfind(" + ", 0, mc + 3)
+                if pos > 0:
+                    linhas.append(texto[:pos]); texto = texto[pos+3:]
+                else:
+                    pos2 = texto.rfind(" ", 0, mc)
+                    if pos2 > 0:
+                        linhas.append(texto[:pos2]); texto = texto[pos2+1:]
+                    else:
+                        linhas.append(texto[:mc]); texto = texto[mc:]
+            if texto: linhas.append(texto)
+            return linhas
+
+        _linhas_long  = _quebrar(_long_label)
+        _linhas_trans = _quebrar(_trans_label)
+
+        # Montar sequência final: long | linha vazia de separação | trans
+        _seq = _linhas_long
+        if _linhas_trans:
+            _seq = _seq + [""] + _linhas_trans  # "" = separação visual
+
+        # Calcular step dinâmico para caber entre y+22mm e y+9mm
+        _INICIO  = 22.0   # mm — onde começa o bloco de armaduras
+        _FIM_MIN =  9.0   # mm — mínimo para não sobrepor "Mat:"
+        _espaco  = _INICIO - _FIM_MIN  # 13mm disponíveis
+        _n       = len(_seq)
+        _step    = _espaco / _n if _n > 0 else 3.5
+        _step    = max(2.8, min(3.8, _step))   # limitar entre 2.8 e 3.8mm
+
+        # Linha "Armaduras:" em negrito
         c.setFont("Helvetica-Bold", 7)
         c.setFillColor(colors.black)
         c.drawString(tx, y + 26*mm, "Armaduras:")
 
-        # Linha em branco implícita (espaço de 4mm entre "Armaduras" e long)
+        # Desenhar cada linha de armadura
         c.setFont("Helvetica", 6.5)
-        c.setFillColor(colors.HexColor("#333333"))
-        c.drawString(tx, y + 22*mm, arm_long_txt[:36])
+        c.setFillColor(colors.HexColor("#222222"))
+        for _i, _linha in enumerate(_seq):
+            if _linha:  # pular linhas vazias (apenas deslocam o cursor)
+                _ypos = (_INICIO - _i * _step) * mm
+                c.drawString(tx, y + _ypos, _linha)
 
-        # Linha em branco implícita (espaço de 4mm entre long e trans)
-        if arm_trans_txt:
-            c.drawString(tx, y + 18*mm, arm_trans_txt[:36])
-
+        # Mat e Pavimento ancorados em posições fixas baixas
+        _y_mat = min((_INICIO - _n * _step) * mm - 0.5*mm, 8.5*mm)
         c.setFont("Helvetica", 7)
-        c.drawString(tx, y + 12*mm, f"Mat: {reg['Material'][:20]}")
+        c.setFillColor(colors.HexColor("#333333"))
+        c.drawString(tx, y + _y_mat, f"Mat: {reg['Material'][:20]}")
 
         c.setFont("Helvetica-Bold", 8)
         c.setFillColor(colors.black)
