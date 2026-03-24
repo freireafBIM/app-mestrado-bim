@@ -1273,21 +1273,11 @@ def gerar_pdf(registros: list[dict], nome_projeto: str) -> io.BytesIO:
     c.setTitle(f"Etiquetas BIM — {nome_projeto}")
     col, x, y = 0, MH, H_PAG - MV - ALTA
 
-    COR_FUNDO  = {
-        "Pilar":    colors.HexColor("#EEF4FF"),
-        "Viga":     colors.HexColor("#FFF4EE"),
-        "Laje":     colors.HexColor("#EEFFEE"),
-        "Fundação": colors.HexColor("#FFFBEE"),
-        "Estaca":   colors.HexColor("#F8EEFF"),
-        "Escada":   colors.HexColor("#EEFFFF"),
-    }
-
     for reg in registros:
         tipo = reg["Tipo_Legivel"]
-        fundo = COR_FUNDO.get(tipo, colors.white)
 
-        # Fundo colorido por tipo
-        c.setFillColor(fundo)
+        # Fundo branco (sem cor por tipo)
+        c.setFillColor(colors.white)
         c.rect(x, y, LARG, ALTA, fill=1, stroke=0)
 
         # Borda
@@ -1323,21 +1313,42 @@ def gerar_pdf(registros: list[dict], nome_projeto: str) -> io.BytesIO:
         geo_str = reg["Geometria"][:26]
         c.drawString(tx, y + 30*mm, geo_str)
 
-        arm_str = reg["Armadura"][:28]
+        # ── Armaduras: separar Long / Trans pelo delimitador " | " ─────────
+        arm_raw = reg["Armadura"]
+        if " | " in arm_raw:
+            arm_long, arm_trans = arm_raw.split(" | ", 1)
+        else:
+            arm_long  = arm_raw
+            arm_trans = ""
+
+        # Remover prefixos "Long: " / "Trans: " para exibição compacta
+        arm_long_txt  = arm_long.replace("Long: ", "").strip()
+        arm_trans_txt = arm_trans.replace("Trans: ", "").strip()
+
+        # Linha "Armaduras" em negrito
         c.setFont("Helvetica-Bold", 7)
-        c.drawString(tx, y + 25*mm, f"Arm: {arm_str}")
+        c.setFillColor(colors.black)
+        c.drawString(tx, y + 26*mm, "Armaduras:")
+
+        # Linha em branco implícita (espaço de 4mm entre "Armaduras" e long)
+        c.setFont("Helvetica", 6.5)
+        c.setFillColor(colors.HexColor("#333333"))
+        c.drawString(tx, y + 22*mm, arm_long_txt[:36])
+
+        # Linha em branco implícita (espaço de 4mm entre long e trans)
+        if arm_trans_txt:
+            c.drawString(tx, y + 18*mm, arm_trans_txt[:36])
 
         c.setFont("Helvetica", 7)
-        c.drawString(tx, y + 20*mm, f"Mat: {reg['Material'][:20]}")
-        c.drawString(tx, y + 16*mm, f"Cob: {reg['Cobrimento_cm']} cm")
+        c.drawString(tx, y + 12*mm, f"Mat: {reg['Material'][:20]}")
 
         c.setFont("Helvetica-Bold", 8)
         c.setFillColor(colors.black)
-        c.drawString(tx, y + 10*mm, reg["Pavimento"][:22])
+        c.drawString(tx, y + 7*mm, reg["Pavimento"][:22])
 
         c.setFont("Helvetica-Oblique", 6.5)
         c.setFillColor(colors.gray)
-        c.drawString(tx, y + 4*mm, f"Obra: {nome_projeto[:22]}")
+        c.drawString(tx, y + 3*mm, f"Obra: {nome_projeto[:22]}")
 
         # ── Avanço de posição ─────────────────────────────────────────────────
         col += 1
