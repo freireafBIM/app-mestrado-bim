@@ -1007,7 +1007,66 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
         cache_arm = indexar_armaduras(ifc, caminho)
 
 
-    # ── 2. Processar cada tipo estrutural ─────────────────────────────────────
+    # ── 2. Fusão de segmentos de nó de viga (≤ 20 cm) ────────────────────────
+    # Segmentos curtos (≤ 20 cm) são trechos de sobreposição sobre pilares ou
+    # outras vigas. Suas barras transversais são somadas ao vão adjacente maior
+    # e o segmento nó é suprimido do relatório (pois na prática a viga é contínua).
+    NOS_VIGAS: set[int] = set()   # IDs de segmentos a suprimir
+
+    # Agrupar segmentos por (nome, pavimento) e calcular comprimento via bbox
+    _segs_por_viga: dict = {}  # (nome, pav) → [(eid, comp_cm), ...]
+    for _elem in ifc.by_type("IfcBeam"):
+        _pav = decode_ifc(
+            (_elem.ContainedInStructure[0].RelatingStructure.Name or "")
+            if _elem.ContainedInStructure else ""
+        ) or "Sem pavimento"
+        _nome = _elem.Name or "S/N"
+        # Comprimento via bounding box da geometria
+        try:
+            _geo = _bbox(_elem)
+            _comp = max(_geo["comp_cm"], _geo["larg_cm"])  # dimensão maior
+        except Exception:
+            _comp = 999.0
+        _key = (_nome, _pav)
+        _segs_por_viga.setdefault(_key, []).append((_elem.id(), _comp))
+
+    for _key, _segs in _segs_por_viga.items():
+        if len(_segs) <= 1:
+            continue  # viga com apenas 1 segmento — nada a fundir
+
+        # Separar vãos e nós
+        _vaos = [(eid, c) for eid, c in _segs if c > 20.0]
+        _nos  = [(eid, c) for eid, c in _segs if c <= 20.0]
+        if not _nos:
+            continue  # sem nós — nada a fazer
+
+        # Para cada nó, transferir barras transversais ao vão mais próximo em volume
+        # (na prática: o vão de menor comprimento que seja adjacente, mas sem
+        # coordenadas de adjacência disponíveis aqui, usamos o de maior comprimento
+        # do mesmo grupo — barra vai para o vão principal da viga)
+        _vao_principal = max(_vaos, key=lambda x: x[1])[0] if _vaos else None
+
+        for _no_eid, _ in _nos:
+            NOS_VIGAS.add(_no_eid)
+            if _vao_principal and _no_eid in cache_arm:
+                # Adicionar barras transversais do nó ao vão principal
+                # Adicionar trans do nó SEM coord_eixo (3 campos),
+                # para que entrem na contagem mas não distorçam o espaçamento
+                # calculado apenas pelas posições regulares do vão.
+                _barras_no = [
+                    (b[0], b[1], b[2])           # (bitola, comp, sub) sem coord
+                    for b in cache_arm[_no_eid]
+                    if isinstance(b, tuple) and len(b) >= 3 and b[2] == "trans"
+                ]
+                if _barras_no:
+                    cache_arm.setdefault(_vao_principal, [])
+                    cache_arm[_vao_principal].extend(_barras_no)
+                del cache_arm[_no_eid]
+
+    if NOS_VIGAS:
+        st.info(f"Fusão de vigas: {len(NOS_VIGAS)} segmento(s) de nó suprimido(s).")
+
+    # ── 3. Processar cada tipo estrutural ─────────────────────────────────────
     registros: list[dict] = []
     total = sum(len(ifc.by_type(t)) for t in TIPOS_ESTRUTURAIS)
 
@@ -1029,6 +1088,10 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
                 processados / total,
                 text=f"{tipo_legivel}: {elem.Name or '?'} ({processados}/{total})"
             )
+
+            # Suprimir segmentos de nó de viga (já fundidos ao vão principal)
+            if tipo_ifc == "IfcBeam" and elem.id() in NOS_VIGAS:
+                continue
 
             nome     = elem.Name or "S/N"
             pavimento = _pavimento(elem)
