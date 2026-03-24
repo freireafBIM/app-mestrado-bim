@@ -1251,10 +1251,10 @@ def gerar_pdf(registros: list[dict], nome_projeto: str) -> io.BytesIO:
         c.drawCentredString(_cx_qr, y + 44.5*mm, reg["Pavimento"][:18])
 
         # ── Timestamp: centralizado abaixo do QR Code ─────────────────────────
-        _data_upload = str(reg.get("Data_Upload", ""))[:10]  # só "DD/MM/AAAA"
+        _hoje = datetime.date.today().strftime("%d/%m/%Y")
         c.setFont("Helvetica-Oblique", 5.5)
         c.setFillColor(colors.HexColor("#555555"))
-        c.drawCentredString(_cx_qr, y + 2.5*mm, f"Gerado em: {_data_upload}")
+        c.drawCentredString(_cx_qr, y + 2.5*mm, f"Gerado em: {_hoje}")
 
         # ── Textos lado direito ───────────────────────────────────────────────
         tx = x + 42 * mm
