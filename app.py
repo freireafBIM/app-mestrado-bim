@@ -1374,27 +1374,32 @@ def processar_ifc(caminho: str, nome_projeto: str, id_projeto: str) -> list[dict
         if len(_segs) <= 1:
             continue  # viga com apenas 1 segmento — nada a fundir
 
-        # Separar vãos e nós
+        # Separar candidatos a nó (segmentos curtos ≤ 20 cm) de vãos
         _vaos = [(eid, c) for eid, c in _segs if c > 20.0]
-        _nos  = [(eid, c) for eid, c in _segs if c <= 20.0]
-        if not _nos:
-            continue  # sem nós — nada a fazer
+        _nos_candidatos = [(eid, c) for eid, c in _segs if c <= 20.0]
+        if not _nos_candidatos:
+            continue  # sem candidatos a nó
 
-        # Para cada nó, transferir barras transversais ao vão mais próximo em volume
-        # (na prática: o vão de menor comprimento que seja adjacente, mas sem
-        # coordenadas de adjacência disponíveis aqui, usamos o de maior comprimento
-        # do mesmo grupo — barra vai para o vão principal da viga)
+        # CRITÉRIO DE VALIDAÇÃO: um segmento curto só é tratado como NÓ se
+        # NÃO possuir barras próprias no cache de armaduras.
+        # Justificativa: no TQS v22/v27, segmentos de nó são trechos de
+        # sobreposição sem armadura própria (barras do vão contínuo passam por eles).
+        # No TQS v24 (FaceBasedSurfaceModel), segmentos curtos de 14-19 cm podem
+        # ser trechos reais da viga com largura/altura da seção coincidindo com a
+        # dimensão do bbox — esses têm barras e NÃO devem ser suprimidos.
+        _nos = [(eid, c) for eid, c in _nos_candidatos
+                if eid not in cache_arm or len(cache_arm[eid]) == 0]
+
+        if not _nos:
+            continue  # todos os candidatos têm barras → segmentos legítimos
+
         _vao_principal = max(_vaos, key=lambda x: x[1])[0] if _vaos else None
 
         for _no_eid, _ in _nos:
             NOS_VIGAS.add(_no_eid)
             if _vao_principal and _no_eid in cache_arm:
-                # Adicionar barras transversais do nó ao vão principal
-                # Adicionar trans do nó SEM coord_eixo (3 campos),
-                # para que entrem na contagem mas não distorçam o espaçamento
-                # calculado apenas pelas posições regulares do vão.
                 _barras_no = [
-                    (b[0], b[1], b[2])           # (bitola, comp, sub) sem coord
+                    (b[0], b[1], b[2])
                     for b in cache_arm[_no_eid]
                     if isinstance(b, tuple) and len(b) >= 3 and b[2] == "trans"
                 ]
