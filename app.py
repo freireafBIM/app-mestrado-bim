@@ -350,7 +350,10 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         return None
 
     def _center_brep(eid_str: str):
-        """Para TQS v22: centróide dos vértices do FacetedBrep."""
+        """Para TQS v22: centróide dos vértices do FacetedBrep.
+        Também cobre IFCFACEBASEDSURFACEMODEL (TQS v24+).
+        Retorna coordenadas RELATIVAS ao placement do elemento.
+        """
         if not _use_manual or eid_str not in _ents: return None
         et,ed = _ents[eid_str]
         parts = ed.split(",")
@@ -358,7 +361,9 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         if repr_id not in _ents: return None
         allowed = {"IFCPRODUCTDEFINITIONSHAPE","IFCSHAPEREPRESENTATION",
                    "IFCFACETEDBREP","IFCCLOSEDSHELL","IFCFACE",
-                   "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT"}
+                   "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT",
+                   # TQS v24+: FaceBasedSurfaceModel
+                   "IFCFACEBASEDSURFACEMODEL","IFCCONNECTEDFACESET"}
         pts=[]; vis=set()
         def _wk(pid, d=0):
             if pid in vis or pid not in _ents or d>12: return
@@ -375,16 +380,51 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
         return (min(xs)+max(xs))/2, (min(ys)+max(ys))/2
 
+    def _placement_offset(eid_str: str) -> tuple:
+        """Retorna (dx, dy) do ObjectPlacement local do elemento.
+        Necessário para TQS v24+: a geometria do elemento é relativa
+        ao placement, enquanto as barras são em coordenadas absolutas.
+        Se o placement for o origin global (0,0), retorna (0,0).
+        """
+        if not _use_manual or eid_str not in _ents: return 0.0, 0.0
+        et,ed = _ents[eid_str]
+        parts = ed.split(",")
+        place_ref = parts[5].strip().lstrip("#") if len(parts)>5 else ""
+        vis = set()
+        def _walk(pid, depth=0):
+            if pid in vis or pid not in _ents or depth>6: return 0.0, 0.0
+            vis.add(pid)
+            pt,pd = _ents[pid]
+            if pt == "IFCLOCALPLACEMENT":
+                for r in _re.findall(r"#(\d+)", pd):
+                    if r not in _ents: continue
+                    rt,rd = _ents[r]
+                    if rt == "IFCAXIS2PLACEMENT3D":
+                        ax_refs = _re.findall(r"#(\d+)", rd)
+                        if ax_refs and _ents.get(ax_refs[0], ("",""))[0] == "IFCCARTESIANPOINT":
+                            c = _re.findall(r"[-\d.E+]+", _ents[ax_refs[0]][1])
+                            if len(c) >= 2:
+                                return float(c[0]), float(c[1])
+            return 0.0, 0.0
+        return _walk(place_ref)
+
     def _get_elem_center(elem) -> tuple | None:
         eid_str = str(elem.id())
         # 1. Tentar via Axis2Placement3D (TQS v27 — ExtrudedAreaSolid)
         c = _center_axis2placement(eid_str)
         if c and (c[0]!=0 or c[1]!=0):
             return c
-        # 2. Tentar via FacetedBrep (TQS v22)
+        # 2. Tentar via FacetedBrep / FaceBasedSurfaceModel (TQS v22 e v24+)
         c = _center_brep(eid_str)
-        if c and (c[0]!=0 or c[1]!=0):
-            return c
+        if c:
+            cx_rel, cy_rel = c
+            # Para TQS v24+, a geometria é relativa ao placement local.
+            # Somar o offset para obter coordenadas absolutas comparáveis às barras.
+            dx, dy = _placement_offset(eid_str)
+            cx_abs = cx_rel + dx
+            cy_abs = cy_rel + dy
+            if cx_abs != 0 or cy_abs != 0:
+                return cx_abs, cy_abs
         # 3. Fallback: ifcopenshell.util.placement
         try:
             import ifcopenshell.util.placement as _pl
@@ -405,10 +445,12 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
 
     _BREP_TYPES = {"IFCPRODUCTDEFINITIONSHAPE","IFCSHAPEREPRESENTATION",
                    "IFCFACETEDBREP","IFCCLOSEDSHELL","IFCFACE",
-                   "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT"}
+                   "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT",
+                   "IFCFACEBASEDSURFACEMODEL","IFCCONNECTEDFACESET"}
 
     def _viga_bbox3d_brep(eid_str: str):
-        """Extrai bbox 3D de viga com FacetedBrep (v22) via vértices do Brep."""
+        """Extrai bbox 3D de viga com FacetedBrep (v22) / FaceBasedSurfaceModel (v24+).
+        Para v24+, soma offset do ObjectPlacement para coordenadas absolutas."""
         if not _use_manual or eid_str not in _ents: return None
         et,ed = _ents[eid_str]
         parts = ed.split(","); repr_id = parts[6].strip().lstrip("#") if len(parts)>6 else ""
@@ -425,7 +467,8 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
             for r in _re.findall(r"#(\d+)",ed2): _wk(r,d+1)
         _wk(repr_id)
         if not pts: return None
-        xs=[p[0] for p in pts]; ys=[p[1] for p in pts]; zs=[p[2] for p in pts]
+        dx_p, dy_p = _placement_offset(eid_str)
+        xs=[p[0]+dx_p for p in pts]; ys=[p[1]+dy_p for p in pts]; zs=[p[2] for p in pts]
         dx=max(xs)-min(xs); dy=max(ys)-min(ys)
         eixo="X" if dx>=dy else "Y"
         return (min(xs),max(xs),min(ys),max(ys),min(zs),max(zs),eixo)
@@ -536,6 +579,47 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
                 pt=_wk(item)
                 if pt: return pt
         return None
+
+    # ── Fallback: centróide via FaceBasedSurfaceModel da barra (TQS v24+) ──────
+    # Algumas barras (vigas negativas, lajes secundárias no TQS 24.x) são
+    # exportadas como IFCFACEBASEDSURFACEMODEL em vez de SweptDiskSolid.
+    # O centróide 3D do sólido fornece a posição XYZ necessária para o
+    # contenimento espacial.
+    _BREP_BAR = {"IFCPRODUCTDEFINITIONSHAPE","IFCSHAPEREPRESENTATION",
+                 "IFCFACEBASEDSURFACEMODEL","IFCCONNECTEDFACESET","IFCFACE",
+                 "IFCFACEOUTERBOUND","IFCPOLYLOOP","IFCCARTESIANPOINT",
+                 "IFCFACETEDBREP","IFCCLOSEDSHELL"}
+
+    def _bar_xyz_facebased(barra) -> tuple | None:
+        """Extrai XYZ da barra via centróide do FaceBasedSurfaceModel (TQS v24+)."""
+        eid_str = str(barra.id())
+        if not _use_manual or eid_str not in _ents: return None
+        et,ed = _ents[eid_str]
+        parts = ed.split(",")
+        repr_id = parts[6].strip().lstrip("#") if len(parts) > 6 else ""
+        if repr_id not in _ents: return None
+        pts3d = []; vis = set()
+        def _wk(pid, d=0):
+            if pid in vis or pid not in _ents or d > 12: return
+            vis.add(pid); et2,ed2 = _ents[pid]
+            if et2 not in _BREP_BAR: return
+            if et2 == "IFCCARTESIANPOINT":
+                c = _re.findall(r"[-\d.E+]+", ed2)
+                if len(c) >= 3:
+                    pts3d.append((float(c[0]), float(c[1]), float(c[2])))
+                return
+            for r in _re.findall(r"#(\d+)", ed2): _wk(r, d+1)
+        _wk(repr_id)
+        if not pts3d: return None
+        xs=[p[0] for p in pts3d]; ys=[p[1] for p in pts3d]; zs=[p[2] for p in pts3d]
+        return ((min(xs)+max(xs))/2, (min(ys)+max(ys))/2, (min(zs)+max(zs))/2)
+
+    def _bar_xyz_full(barra) -> tuple | None:
+        """Retorna (x,y,z) da barra: tenta SweptDiskSolid primeiro,
+        depois centróide FaceBasedSurfaceModel como fallback (TQS v24+)."""
+        pt = _bar_xyz(barra)
+        if pt is not None: return pt
+        return _bar_xyz_facebased(barra)
 
     # Alias para compatibilidade: só (x,y)
     def _bar_xy(barra):
@@ -675,7 +759,7 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
             pav = storey_por_elem.get(barra.id(),"Sem pavimento")
 
             # — Método 1: containment espacial ─────────────────────────────
-            xyz = _bar_xyz(barra)
+            xyz = _bar_xyz_full(barra)
             if xyz is not None:
                 bx,by,bz = xyz
 
