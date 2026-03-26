@@ -614,12 +614,47 @@ def indexar_armaduras(ifc_file, ifc_path: str | None = None) -> dict:
         xs=[p[0] for p in pts3d]; ys=[p[1] for p in pts3d]; zs=[p[2] for p in pts3d]
         return ((min(xs)+max(xs))/2, (min(ys)+max(ys))/2, (min(zs)+max(zs))/2)
 
+    def _bar_placement_z(barra) -> float:
+        """Retorna o offset Z do ObjectPlacement da barra.
+        No TQS v24+, cada barra tem um placement local com Z = posição real do estribo.
+        No TQS v22/v27, o placement é em (0,0,0) ou o Z já está no SweptDiskSolid.
+        Sempre seguro somar: se dz=0, não altera o resultado.
+        """
+        eid_str = str(barra.id())
+        if not _use_manual or eid_str not in _ents: return 0.0
+        et, ed = _ents[eid_str]
+        parts = ed.split(",")
+        place_ref = parts[5].strip().lstrip("#") if len(parts) > 5 else ""
+        vis = set()
+        def _wk(pid, d=0):
+            if pid in vis or pid not in _ents or d > 6: return 0.0
+            vis.add(pid); pt, pd = _ents[pid]
+            if pt == "IFCLOCALPLACEMENT":
+                for r in _re.findall(r"#(\d+)", pd):
+                    if r not in _ents: continue
+                    rt, rd = _ents[r]
+                    if rt == "IFCAXIS2PLACEMENT3D":
+                        ax = _re.findall(r"#(\d+)", rd)
+                        if ax and _ents.get(ax[0], ("",""))[0] == "IFCCARTESIANPOINT":
+                            c = _re.findall(r"[-\d.E+]+", _ents[ax[0]][1])
+                            if len(c) >= 3: return float(c[2])
+            return 0.0
+        return _wk(place_ref)
+
     def _bar_xyz_full(barra) -> tuple | None:
-        """Retorna (x,y,z) da barra: tenta SweptDiskSolid primeiro,
-        depois centróide FaceBasedSurfaceModel como fallback (TQS v24+)."""
+        """Retorna (x,y,z) absoluto da barra.
+        Z = z_local (SweptDiskSolid) + dz_placement (ObjectPlacement).
+        Isso unifica v22/v27 (dz=0, z_local=Z_abs) e v24 (dz=Z_abs, z_local≈cte).
+        """
         pt = _bar_xyz(barra)
-        if pt is not None: return pt
-        return _bar_xyz_facebased(barra)
+        if pt is not None:
+            dz = _bar_placement_z(barra)
+            return (pt[0], pt[1], pt[2] + dz)
+        pt = _bar_xyz_facebased(barra)
+        if pt is not None:
+            dz = _bar_placement_z(barra)
+            return (pt[0], pt[1], pt[2] + dz)
+        return None
 
     # Alias para compatibilidade: só (x,y)
     def _bar_xy(barra):
@@ -893,12 +928,29 @@ def _parse_barra(b):
 def _espaçamento_estribos(zs: list[float]) -> int:
     """Calcula espaçamento nominal (cm, inteiro) a partir das alturas Z dos estribos.
     Mede distância c/c e arredonda para inteiro — recupera o valor nominal de projeto.
+
+    Trata dois casos comuns no TQS:
+    - Duplicatas exatas: dois estribos no mesmo Z (grampo + estribo, duplo estribo).
+      Resolvido desduplicando com tolerância de 1 cm antes de calcular diffs.
+    - Diffs próximas de zero após deduplicação: descartadas para não distorcer a média.
     """
     if len(zs) < 2:
         return 0
+    # Deduplicar: manter apenas um valor por grupo de Z dentro de 1 cm
     zs_ord = sorted(zs)
-    diffs = [zs_ord[i+1] - zs_ord[i] for i in range(len(zs_ord)-1)]
-    return round(sum(diffs) / len(diffs))
+    zs_unico = [zs_ord[0]]
+    for z in zs_ord[1:]:
+        if z - zs_unico[-1] > 1.0:   # tolerância 1 cm
+            zs_unico.append(z)
+    if len(zs_unico) < 2:
+        return 0
+    diffs = [zs_unico[i+1] - zs_unico[i] for i in range(len(zs_unico)-1)]
+    # Descartar diffs residuais < 1 cm (não deveria acontecer após deduplicação,
+    # mas é uma salvaguarda adicional)
+    diffs_validos = [d for d in diffs if d > 1.0]
+    if not diffs_validos:
+        return 0
+    return round(sum(diffs_validos) / len(diffs_validos))
 
 
 def formatar_armadura(cache: dict, elem_eid: int) -> str:
